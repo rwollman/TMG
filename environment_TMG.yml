@@ -1,0 +1,51 @@
+name: TMG
+channels:
+  - conda-forge
+  - pytorch
+  - defaults
+dependencies:
+  # Core Python and scientific computing
+  - python>=3.8
+  - numpy
+  - pandas
+  - scipy
+  - matplotlib
+  - seaborn
+  
+  # Machine learning and data analysis
+  - scikit-learn
+  - pytorch
+  - anndata
+  
+  # Graph analysis
+  - python-igraph  # Note: different name in conda
+  - leidenalg
+  - pynndescent
+  
+  # Dimensionality reduction and clustering
+  - umap-learn
+  
+  # Image processing  
+  - scikit-image
+  - rasterio
+  
+  # Utilities and progress
+  - tqdm
+  - joblib
+  
+  # Geospatial and geometric
+  - shapely
+  
+  # Visualization extras
+  - colorcet
+  
+  # Development and jupyter
+  - jupyter
+  - ipython
+  
+  
+  # pip-only packages (not available in conda)
+  - pip
+  - pip:
+    - colormath
+    - xycmap  # Usually better via pip for latest version 
