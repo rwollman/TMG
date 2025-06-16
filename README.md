@@ -1,6 +1,6 @@
 # TMG - TissueMultiGraph Analysis and Visualization Package
 
-TMG is a comprehensive Python package for analyzing and visualizing tissue data using multi-layer graph representations. This package was extracted from the dredFISH project to provide focused functionality for tissue analysis and visualization.
+TMG is a comprehensive Python package for analyzing and visualizing tissue data using multi-layer graph representations. This package provides core datastructure (TMG) and functionality for tissue analysis and visualization.
 
 ## Features
 

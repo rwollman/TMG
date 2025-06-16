@@ -16,14 +16,13 @@ Main modules:
 
 __version__ = "1.0.0"
 
-# Import main classes and functions
-from .Analysis.TissueGraph import TissueMultiGraph, TissueGraph, Taxonomy, Geom
-from .Analysis.Classification import *
-from .Visualization.Viz import *
+# Import main submodules
+from . import Analysis
+from . import Visualization
+from . import Utils
 
 __all__ = [
-    'TissueMultiGraph',
-    'TissueGraph', 
-    'Taxonomy',
-    'Geom'
+    'Analysis',
+    'Visualization', 
+    'Utils'
 ]

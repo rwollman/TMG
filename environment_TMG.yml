@@ -42,6 +42,7 @@ dependencies:
   # Development and jupyter
   - jupyter
   - ipython
+  - ipykernel  
   
   
   # pip-only packages (not available in conda)
