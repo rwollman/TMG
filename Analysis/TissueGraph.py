@@ -207,7 +207,7 @@ class TissueMultiGraph:
         :type level: int, optional
         """
         if (self.verbose)|(verbose==True):
-            print(datetime.now().strftime("%Y %B %d %H:%M:%S") + ' ' + message)
+            print(datetime.datetime.now().strftime("%Y %B %d %H:%M:%S") + ' ' + message)
         fileu.update_user(message,level=level,logger=self.log)
 
     def _load(self):
@@ -1010,7 +1010,7 @@ class TissueGraph:
         :type level: int, optional
         """
         if self.verbose:
-            print(datetime.now().strftime("%Y %B %d %H:%M:%S") + ' ' + message)
+            print(datetime.datetime.now().strftime("%Y %B %d %H:%M:%S") + ' ' + message)
         fileu.update_user(message,level=level,logger=self.log)
     
     def is_empty(self):

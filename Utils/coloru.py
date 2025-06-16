@@ -13,6 +13,22 @@ from matplotlib.colors import LinearSegmentedColormap
 
 from scipy.spatial.distance import pdist
 
+def scale_vec(x, low, high):
+    """
+    Scale vector between bounds
+
+    Input
+    -----
+    x : 1D vector
+    low : minimum value after rescaling
+    high : maximum value after rescaling
+
+    Output
+    ------
+    NumPy array : rescaled values 
+    """
+    return ((high - low) * (x - x.min()) / (x.max() - x.min())) + low
+
 def color_diff(clr1,clr2, mode = "RGB",de = "1976"):
     """
     clr1/2 are 3 elements only
