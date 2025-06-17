@@ -271,7 +271,7 @@ def create_cell_boundaries_geom_xenium(tmg: TissueMultiGraph, xenium_path: str):
         tmg.Geoms = [None] * len(tmg.unqS)
     
     # Add to TMG
-    section_idx = tmg.unqS.index(section_name)
+    section_idx = list(tmg.unqS).index(section_name)
     if tmg.Geoms[section_idx] is None:
         tmg.Geoms[section_idx] = {}
     tmg.Geoms[section_idx]['cell'] = geom
