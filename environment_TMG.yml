@@ -29,6 +29,9 @@ dependencies:
   - scikit-image
   - rasterio
   
+  # File format support
+  - pyarrow  # For parquet file support
+  
   # Utilities and progress
   - tqdm
   - joblib
