@@ -64,6 +64,8 @@ def create_and_save_geoms(sec, xy, basepath):
 
     return sec_geoms
 
+
+
 # define function (not nested...) to be used in parallel code
 def create_and_save_merged_geoms(sec, polys, ids, basepath,geom_type): 
     merged_polys = geomu.merge_polygons_by_ids(polys,ids)
@@ -298,7 +300,7 @@ class TissueMultiGraph:
             geom_types = [geom_types]
 
         for s in sections: 
-            ix = self.unqS.index(s)
+            ix = list(self.unqS).index(s)
             section_geoms = dict()
             for gt in geom_types:
                 section_geoms[gt] = Geom(geom_type=gt,polys=None,basepath=self.basepath, section=s)
@@ -761,14 +763,6 @@ class TissueMultiGraph:
         if self._unqS is None:
             assert len(self.Layers)
             self._unqS = self.Layers[0].unqS
-        #     Sections = self.Layers[0].Section
-        #     """ order based on ccf_location {animal}_{ccf_x}"""
-        #     def get_ccf_x(section):
-        #         return float(section.split('_')[1])
-        #     # Sort Sections based on ccf_x from lowest to highest
-        #     self._unqS = sorted(np.unique(Sections), key=get_ccf_x)
-        #     # self._unqS = list(np.unique(Sections))
-        # # return a list of (unique) sections 
         return(self._unqS)
 
     @property
@@ -816,6 +810,78 @@ class TissueMultiGraph:
             self.Geoms[i][merge_layer_geom_type]=g
 
 
+    def filter(self, logical_vec, layer_id=0):
+        """
+        Filter TMG by removing observations from both the specified layer and corresponding geometries.
+        
+        This method ensures that layers and geometries stay synchronized when filtering.
+        
+        Parameters
+        ----------
+        logical_vec : array-like of bool
+            Boolean mask indicating which observations to keep
+        layer_id : int, default 0
+            Which layer to filter (typically 0 for cell layer)
+            
+        Examples
+        --------
+        >>> # Filter to keep only cells with ROI assignments
+        >>> TMG.filter(L != 0)  # L is ROI assignment vector
+        """
+        
+        self.update_user(f"Filtering TMG: keeping {logical_vec.sum()}/{len(logical_vec)} observations")
+        
+        # Filter the specified layer
+        original_n = self.Layers[layer_id].N
+        self.Layers[layer_id].filter(logical_vec, rebuild_SG=True)
+        filtered_n = self.Layers[layer_id].N
+        
+        self.update_user(f"Layer {layer_id} filtered: {original_n} -> {filtered_n} observations")
+        
+        # Check if geometries exist on disk but aren't loaded
+        geom_files = []
+        geom_path = os.path.join(self.basepath, 'Geom')
+        if os.path.exists(geom_path):
+            # Check if there are geometry files on disk
+            for section in self.unqS:
+                section_geom_path = os.path.join(geom_path, section)
+                if os.path.exists(section_geom_path):
+                    wkt_files = [f for f in os.listdir(section_geom_path) if f.endswith('.wkt')]
+                    if wkt_files:
+                        geom_files.extend(wkt_files)
+            
+            if geom_files and (not hasattr(self, 'Geoms') or self.Geoms is None):
+                raise ValueError(
+                    f"Geometry files found on disk ({len(geom_files)} files) but geometries are not loaded in memory. "
+                    f"Before filtering, you must either:\n"
+                    f"1. Load geometries: TMG.load_geoms()\n"
+                    f"2. Or filter without geometries and reload them later\n"
+                    f"Geometry files found in: {geom_path}"
+                )
+        
+        # Filter geometries if they exist in memory
+        if hasattr(self, 'Geoms') and self.Geoms is not None:
+            self.update_user("Filtering geometries to match filtered layer...")
+            
+            for section_idx, section_geoms in enumerate(self.Geoms):
+                if section_geoms is not None:
+                    for geom_type, geom_obj in section_geoms.items():
+                        if geom_obj is not None and geom_obj.polys is not None:
+                            original_geom_count = len(geom_obj.polys)
+                            
+                            # Apply the same filter to geometries
+                            if len(logical_vec) == original_geom_count:
+                                filtered_polys = [geom_obj.polys[i] for i, keep in enumerate(logical_vec) if keep]
+                                geom_obj.polys = filtered_polys
+                                self.update_user(f"  {geom_type} section {section_idx}: {original_geom_count} -> {len(filtered_polys)} polygons")
+                            else:
+                                self.update_user(f"  Warning: {geom_type} section {section_idx} has {original_geom_count} polygons but filter has {len(logical_vec)} entries")
+                                
+        # Clear cached unique sections since filtering may have changed section composition
+        self._unqS = None
+        
+        self.update_user("TMG filtering completed")
+
     def load_stiched_labeled_image(self,section = '',label_type = 'total',flip = True):
         if section is None:
             section = self.unqS[0]
@@ -845,6 +911,216 @@ class TissueMultiGraph:
             lbl_filtered = np.transpose(lbl_filtered) 
 
         return(lbl_filtered)
+
+    def split_into_sections(self, section_names, rebuild_geoms=True, save_after_split=True):
+        """
+        Split TMG data into multiple sections based on provided section names.
+        
+        This method properly handles section-dependent data including Geom objects,
+        spatial graphs, and other section-specific properties.
+        
+        Parameters
+        ----------
+        section_names : array-like of str
+            Array of section names for each cell/observation. Must have same 
+            length as number of observations in the first layer.
+        rebuild_geoms : bool, default True
+            Whether to rebuild geometry objects for the new sections
+        save_after_split : bool, default True
+            Whether to save the TMG after splitting
+            
+        Returns
+        -------
+        None
+            Modifies the TMG object in place
+            
+        Examples
+        --------
+        >>> # Create section names based on polygon assignments
+        >>> section_base = TMG.Layers[0].unqS[0][:-3]  # Remove last 3 chars
+        >>> section_names = [f"{section_base}{assignment:02d}" for assignment in roi_selector.final_output]
+        >>> TMG.split_into_sections(section_names)
+        """
+        
+        self.update_user("Starting section splitting...")
+        
+        # Validate input
+        if len(section_names) != self.Layers[0].N:
+            raise ValueError(f"section_names length ({len(section_names)}) "
+                           f"must match number of observations ({self.Layers[0].N})")
+        
+        # Convert to numpy array 
+        section_names = np.array(section_names, dtype=str)
+        
+        # Get unique sections and their counts
+        unique_sections, counts = np.unique(section_names, return_counts=True)
+        self.update_user(f"Splitting into {len(unique_sections)} sections: {unique_sections}")
+        self.update_user(f"Section sizes: {dict(zip(unique_sections, counts))}")
+        
+        # Store original section name for geometry splitting
+        original_section = self.Layers[0].unqS[0]
+        
+        # Update section names for each layer
+        for layer_idx, layer in enumerate(self.Layers):
+            self.update_user(f"Updating sections for layer {layer_idx} ({layer.layer_type})")
+            
+            # Use the provided section names directly
+            layer.Section = section_names
+            
+            # Clear any cached spatial graphs since section boundaries changed
+            if hasattr(layer, 'SG') and layer.SG is not None:
+                self.update_user(f"Clearing spatial graphs for layer {layer_idx}")
+                layer.SG = None
+                layer._spatial_edge_list = None
+                
+            # Clear cached KNN objects
+            if hasattr(layer, 'SG_knn'):
+                layer.SG_knn = None
+        
+        # Update cached unique sections
+        self._unqS = None
+        
+        # Handle geometries based on rebuild_geoms flag
+        if rebuild_geoms:
+            self.update_user("Geometry rebuilding requested - processing existing geometries...")
+            
+            # Handle existing geometries 
+            existing_geoms = {}
+            if hasattr(self, 'Geoms') and self.Geoms is not None and len(self.Geoms) > 0:
+                # Find which geometry types exist for the original section
+                original_section_idx = 0  # Assuming single section originally
+                if self.Geoms[original_section_idx] is not None:
+                    for geom_type, geom_obj in self.Geoms[original_section_idx].items():
+                        self.update_user(f"Found existing geometry type: {geom_type}")
+                        
+                        # Load the polygons for this geometry type
+                        if geom_obj.polys is not None:
+                            existing_geoms[geom_type] = geom_obj.polys
+                        else:
+                            # Try to load from file
+                            try:
+                                existing_geoms[geom_type] = fileu.load_polygon_list(geom_obj.filename)
+                                self.update_user(f"Loaded {len(existing_geoms[geom_type])} polygons for {geom_type}")
+                            except Exception as e:
+                                self.update_user(f"Warning: Could not load {geom_type} geometries: {e}")
+            
+            # Clear existing geometry objects since section boundaries changed
+            self.update_user("Clearing existing geometry objects")
+            self.Geoms = None
+                                
+            # Split existing geometries by section names
+            if existing_geoms:
+                self.update_user("Splitting existing geometries by section assignments...")
+                self._split_and_save_geometries(existing_geoms, section_names, unique_sections)
+                self.update_user("Existing geometries were split - skipping rebuilding to avoid memory issues")
+                self.update_user("If you need voronoi/mask geometries, call add_and_save_vor_mask_geoms() manually")
+            else:
+                self.update_user("No existing geometries found - rebuilding voronoi and mask geometries...")
+                try:
+                    # Try to rebuild voronoi and mask geometries
+                    self.add_and_save_vor_mask_geoms()
+                    self.update_user("Successfully rebuilt voronoi and mask geometries")
+                except Exception as e:
+                    self.update_user(f"Warning: Could not rebuild additional geometries automatically: {e}")
+                    self.update_user("You may need to manually rebuild geometries using add_and_save_vor_mask_geoms()")
+        else:
+            self.update_user("Geometry rebuilding disabled - clearing geometry references but keeping files")
+            # Just clear geometry references from TMG but keep the files on disk
+            self.Geoms = None
+        
+        # Rebuild spatial graphs for the new sections
+        self.update_user("Rebuilding spatial graphs for new sections...")
+        for layer_idx, layer in enumerate(self.Layers):
+            if layer.layer_type == "cell":  # Only rebuild for cell layers
+                try:
+                    layer.build_spatial_graph()
+                    self.update_user(f"Rebuilt spatial graph for layer {layer_idx}")
+                except Exception as e:
+                    self.update_user(f"Warning: Could not rebuild spatial graph for layer {layer_idx}: {e}")
+        
+        # Save the updated TMG if requested
+        if save_after_split:
+            self.update_user("Saving updated TMG...")
+            try:
+                self.save()
+                # Also save individual layers
+                for layer in self.Layers:
+                    layer.save()
+                self.update_user("Successfully saved TMG and layers")
+            except Exception as e:
+                self.update_user(f"Warning: Could not save TMG: {e}")
+        
+        self.update_user(f"Section splitting completed. TMG now has {self.Nsections} sections: {self.unqS}")
+        
+        return
+        
+    def _split_and_save_geometries(self, existing_geoms, section_names, unique_sections):
+        """
+        Split existing geometries based on section names and save to new files.
+        
+        Parameters
+        ----------
+        existing_geoms : dict
+            Dictionary mapping geometry type to list of polygons
+        section_names : array
+            Section name for each cell/polygon
+        unique_sections : array
+            Unique section names
+        """
+        from TMG.Utils import fileu
+        
+        # Initialize Geoms list for the new sections (indexed by position in self.unqS)
+        self.Geoms = [None] * len(self.unqS)
+        
+        for geom_type, polygons in existing_geoms.items():
+            self.update_user(f"Splitting {geom_type} geometries into {len(unique_sections)} sections...")
+            
+            # Validate that we have the right number of polygons
+            if len(polygons) != len(section_names):
+                self.update_user(f"Warning: {geom_type} has {len(polygons)} polygons but "
+                               f"section_names has {len(section_names)} entries. Skipping.")
+                continue
+            
+            # Split polygons by section
+            for section_name in unique_sections:
+                # Get indices for this section
+                section_mask = section_names == section_name
+                section_polygons = [polygons[i] for i in range(len(polygons)) if section_mask[i]]
+                
+                if len(section_polygons) == 0:
+                    self.update_user(f"Warning: No polygons found for section {section_name} in {geom_type}")
+                    continue
+                    
+                self.update_user(f"Creating {geom_type} geometry for section {section_name} "
+                               f"with {len(section_polygons)} polygons")
+                
+                # Create and save geometry for this section
+                try:
+                    geom = Geom(geom_type=geom_type, 
+                              polys=section_polygons,
+                              basepath=self.basepath, 
+                              section=section_name)
+                    geom.save()
+                    
+                    # Find the correct index in self.unqS for this section name
+                    section_idx = list(self.unqS).index(section_name)
+                    
+                    # Initialize Geoms entry for this section if needed
+                    if self.Geoms[section_idx] is None:
+                        self.Geoms[section_idx] = {}
+                    
+                    # Add to TMG Geoms
+                    self.Geoms[section_idx][geom_type] = geom
+                    
+                    self.update_user(f"Successfully saved {geom_type} geometry for section {section_name}")
+                    
+                except Exception as e:
+                    self.update_user(f"Error saving {geom_type} geometry for section {section_name}: {e}")
+        
+        # Update geometry mappings if we processed cell geometries
+        if 'cell' in existing_geoms:
+            self.geom_to_layer_type_mapping['cell'] = 'cell'
+            self.layer_to_geom_type_mapping['cell'] = 'cell'
 
 class TissueGraph:
     """Representation of transcriptional state of biospatial units as a graph. 
@@ -1035,9 +1311,9 @@ class TissueGraph:
 
         # rebuild igraph layers (that are only saved as adj matrix within anndata)
         if rebuild_SG and self.SG != None: 
-            if self.SG_knn is None: 
+            if not hasattr(self, 'SG_knn') or self.SG_knn is None:
                 self.build_spatial_graph()
-            else: 
+            else:
                 self.build_spatial_graph(save_knn=True)
         else:
             # after filtering, need to rebuild SG, if it existed (and rebuild_SG was False) zeros it out
@@ -1213,10 +1489,11 @@ class TissueGraph:
     
     @property
     def unqS(self):
-        
-        def get_ccf_x(section):
-            return float(re.split('[_\.]', section)[1])
-        return sorted(np.unique(self.Section), key=get_ccf_x)
+        return np.unique(self.Section)
+        # below is brain specific stuff - keeping it commented in case we need it sometimes. 
+        # def get_ccf_x(section):
+        #     return float(re.split('[_\.]', section)[1])
+        # return sorted(np.unique(self.Section), key=get_ccf_x)
 
     @property
     def size_of_sections(self):
@@ -1243,7 +1520,7 @@ class TissueGraph:
     def get_XY(self,section = None):
         if section is None: 
             return(self.XY)
-        elif isinstance(section, list):
+        elif isinstance(section, list) or isinstance(section, np.ndarray) or isinstance(section,pd.Series):
             return [self.XY[self.Section == sec, :] for sec in section]
         else: 
             return(self.XY[self.Section == section,:])
@@ -1251,10 +1528,10 @@ class TissueGraph:
     def get_obs(self,column,section = None):
         if section is None: 
             return(self.adata.obs[column])
-        elif isinstance(section, list):
-            return [self.adata.obs[column][self.Section == sec, :] for sec in section]
+        elif isinstance(section, list) or isinstance(section, np.ndarray) or isinstance(section, pd.Series):
+            return [self.adata.obs[column][self.Section == sec] for sec in section]
         else: 
-            return(self.adata.obs[column][self.Section == section, :])
+            return(self.adata.obs[column][self.Section == section])
         
     def get_N(self, section=None): 
         if section is None: 
