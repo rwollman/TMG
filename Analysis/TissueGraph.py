@@ -763,7 +763,7 @@ class TissueMultiGraph:
         if self._unqS is None:
             assert len(self.Layers)
             self._unqS = self.Layers[0].unqS
-        return(self._unqS)
+        return(list(self._unqS))
 
     @property
     def tax_names(self): 
@@ -2220,7 +2220,10 @@ class Taxonomy:
                 rgb = coloru.hex_to_rgb(rgb)
                 rgb = np.array(rgb)
         else: 
-            rgb = coloru.rand_hex_codes(self.adata.shape[0])
+            rgb_hex = coloru.rand_hex_codes(self.adata.shape[0])
+            self.adata.obs['RGB']=rgb_hex
+            rgb = coloru.hex_to_rgb(rgb_hex)
+            rgb = np.array(rgb)
         return rgb
 
     @RGB.setter
