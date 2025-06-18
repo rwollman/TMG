@@ -116,7 +116,7 @@ def load_xenium_data(xenium_path: str,
     
     # Add taxonomy and cell type information
     print("Adding cell type taxonomy...")
-    _create_cell_taxonomy_xenium(tmg, clustering_data)
+    _create_cell_taxonomy_xenium(tmg, clustering_data, adata)
     
     # Create geometries if requested
     if create_geometries:
@@ -332,13 +332,44 @@ def _merge_and_filter_data_xenium(adata: anndata.AnnData,
         clustering_indexed = clustering_data.set_index('cell_id')
         common_clustered_cells = adata.obs.index.intersection(clustering_indexed.index)
         if len(common_clustered_cells) > 0:
+            # Store original cluster IDs
             adata.obs.loc[common_clustered_cells, 'Cluster'] = clustering_indexed.loc[common_clustered_cells, 'Cluster']
-            adata.obs['Type'] = adata.obs['Cluster'].fillna(-1).astype(int)
+            
+            # Check if there are missing cluster assignments
+            cluster_values = adata.obs['Cluster']
+            has_missing_clusters = cluster_values.isna().any() or len(common_clustered_cells) < len(adata.obs)
+            
+            # Create mapping from cluster IDs to 0-based indices for Taxonomy
+            unique_clusters = sorted(clustering_data['Cluster'].unique())
+            
+            if has_missing_clusters:
+                # Reserve index 0 for "Unknown" type, actual clusters start at index 1
+                cluster_to_index = {cluster_id: idx + 1 for idx, cluster_id in enumerate(unique_clusters)}
+                type_values = np.zeros(len(adata.obs), dtype=int)  # Default to 0 (Unknown)
+                
+                for i, cluster_val in enumerate(cluster_values):
+                    if pd.notna(cluster_val) and cluster_val in cluster_to_index:
+                        type_values[i] = cluster_to_index[cluster_val]
+                    # else: stays 0 (Unknown type)
+            else:
+                # No missing values, use direct 0-based indexing
+                cluster_to_index = {cluster_id: idx for idx, cluster_id in enumerate(unique_clusters)}
+                type_values = np.zeros(len(adata.obs), dtype=int)
+                
+                for i, cluster_val in enumerate(cluster_values):
+                    if pd.notna(cluster_val) and cluster_val in cluster_to_index:
+                        type_values[i] = cluster_to_index[cluster_val]
+            
+            adata.obs['Type'] = type_values
+            # Store whether we have missing clusters for taxonomy creation
+            adata.uns['has_missing_clusters'] = has_missing_clusters
         else:
             print("Warning: No overlap between expression data and clustering results")
             adata.obs['Type'] = 0  # Default type
+            adata.uns['has_missing_clusters'] = True  # Will need Unknown type
     else:
         adata.obs['Type'] = 0  # Default type
+        adata.uns['has_missing_clusters'] = True  # Will need Unknown type
     
     # Apply filters
     # Filter cells by transcript count (use the correct column name)
@@ -363,19 +394,29 @@ def _merge_and_filter_data_xenium(adata: anndata.AnnData,
     return adata
 
 
-def _create_cell_taxonomy_xenium(tmg: TissueMultiGraph, clustering_data: pd.DataFrame):
+def _create_cell_taxonomy_xenium(tmg: TissueMultiGraph, clustering_data: pd.DataFrame, adata: anndata.AnnData):
     """Create and add cell type taxonomy to TMG from Xineum clustering results."""
     if clustering_data.empty:
-        # Create simple taxonomy with single type
+        # Create simple taxonomy with single Unknown type
         types = ['Unknown']
         taxonomy = Taxonomy(name='xenium_types', basepath=tmg.basepath,
                            Types=types, feature_mat=np.ones((1, 1)))
     else:
         # Create taxonomy from clustering results
+        # Get unique clusters and sort them to ensure consistent indexing
         unique_clusters = sorted(clustering_data['Cluster'].unique())
-        types = [f'Cluster_{i}' for i in unique_clusters]
         
-        # Create simple feature matrix (identity matrix for now)
+        # Check if we need Unknown type
+        has_missing_clusters = adata.uns.get('has_missing_clusters', True)
+        
+        if has_missing_clusters:
+            # Start with "Unknown" type at index 0, then add cluster types
+            types = ['Unknown'] + [f'Cluster_{cluster_id}' for cluster_id in unique_clusters]
+        else:
+            # No missing clusters, just use cluster types directly
+            types = [f'Cluster_{cluster_id}' for cluster_id in unique_clusters]
+        
+        # Create simple feature matrix (identity matrix)
         n_types = len(types)
         feature_mat = np.eye(n_types)
         
