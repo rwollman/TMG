@@ -2077,6 +2077,70 @@ class TissueGraph:
             Smoothed[j] = np.nanmedian(VecToSmooth[ix])
         return(Smoothed)
 
+    def type_neighbor_frequency(self, taxonomy=None):
+        """
+        Calculate the frequency of type-type neighbors based on spatial connectivity.
+        
+        Uses the spatial edge list to determine which nodes are neighbors, then maps
+        these to their types to create a frequency matrix of type-type interactions.
+        
+        Parameters
+        ----------
+        taxonomy : Taxonomy, optional
+            Taxonomy object to define the complete set of types. If provided, the
+            resulting matrix will have dimensions matching the taxonomy types,
+            even if some types are not present in the current tissue graph.
+            
+        Returns
+        -------
+        freq_matrix : np.ndarray
+            NxN matrix where N is the number of types (from taxonomy if provided,
+            or unique types in data), showing the frequency of neighbors between 
+            each type pair. Matrix is symmetric since spatial graph is undirected.
+        types_used : np.ndarray
+            Array of type values corresponding to the rows/columns of freq_matrix
+            
+        Examples
+        --------
+        >>> freq_matrix, types = tg.type_neighbor_frequency()
+        >>> # freq_matrix[i,j] gives frequency of neighbors between types[i] and types[j]
+        
+        >>> # Using taxonomy to ensure all types are represented
+        >>> freq_matrix, types = tg.type_neighbor_frequency(taxonomy=tax)
+        """
+        if self.Type is None:
+            raise ValueError("Type not yet assigned, can't calculate type neighbor frequency")
+        
+        if self.SG is None:
+            raise ValueError("Spatial graph not built, can't calculate spatial neighbors")
+        
+        # Get spatial edge list (Mx2 array of connected node pairs)
+        edge_list = self.spatial_edge_list
+        
+        # Get types for each node
+        node_types = self.Type
+        
+        # Create Mx2 array of type pairs for each edge
+        type_pairs = np.column_stack([node_types[edge_list[:, 0]], node_types[edge_list[:, 1]]])
+        
+        # Determine matrix size
+        if taxonomy is not None:
+            # Use taxonomy size - ensures all taxonomy types are represented
+            n_types = taxonomy.N
+            types_used = np.array(range(taxonomy.N))
+        else:
+            # Use max type value + 1 since types are indices into the matrix
+            n_types = np.max(node_types) + 1
+            types_used = np.unique(node_types)
+        
+        # Initialize frequency matrix
+        freq_matrix = np.zeros((n_types, n_types), dtype=int)
+        
+        # Count each edge once and make symmetric
+        np.add.at(freq_matrix, (type_pairs[:, 0], type_pairs[:, 1]), 1)
+
+        return freq_matrix, types_used
+
 class Taxonomy:
     """Taxonomical system for different biospatial units (cells, isozones, regions)
     
