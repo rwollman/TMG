@@ -215,6 +215,31 @@ class SingleMapView(View):
 
         if len(TMG.unqS)==1 and section is None: 
             section = TMG.unqS[0]
+        
+        # Auto-calculate view limits based on actual XY data for the section
+        # Only do this if xlim and ylim are not explicitly provided in kwargs
+        if 'xlim' not in kwargs or 'ylim' not in kwargs:
+            try:
+                # Get XY coordinates for the specified section
+                xy_data = TMG.Layers[0].get_XY(section=section)
+                if xy_data is not None and len(xy_data) > 0:
+                    # Calculate bounds with small margin
+                    x_min, x_max = xy_data[:, 0].min(), xy_data[:, 0].max()
+                    y_min, y_max = xy_data[:, 1].min(), xy_data[:, 1].max()
+                    
+                    # Add 5% margin on each side
+                    x_margin = (x_max - x_min) * 0.05
+                    y_margin = (y_max - y_min) * 0.05
+                    
+                    # Update the view limits if not provided in kwargs
+                    if 'xlim' not in kwargs:
+                        self.lims['x'] = np.array([x_min - x_margin, x_max + x_margin])
+                    if 'ylim' not in kwargs:
+                        self.lims['y'] = np.array([y_min - y_margin, y_max + y_margin])
+            except Exception as e:
+                # If auto-calculation fails, keep default limits and warn
+                print(f"Warning: Could not auto-calculate limits from XY data: {e}")
+                print("Using default hardcoded limits.")
       
         if map_type == 'type':
             geom_type = TMG.layer_to_geom_type_mapping[level_type]
@@ -435,6 +460,7 @@ class LayeredMap(Panel):
         self.xlim = kwargs.get('xlim',None)
         self.ylim = kwargs.get('ylim',None)
         self.rotation = kwargs.get('rotation',None)
+        self.axis_off = kwargs.get('axis_off', True)  # Default to axis off
 
         # section information: which section in TMG are we plotting
         self.section = section
@@ -463,7 +489,8 @@ class LayeredMap(Panel):
                                             rgb_edges = geom_to_plot["rgb_edges"], 
                                             ax = self.ax,
                                             xlm = self.xlim,ylm = self.ylim,
-                                            rotation = self.rotation)
+                                            rotation = self.rotation,
+                                            axis_off = self.axis_off)
                 
             elif geom_to_plot["plot_type"] == "lines":
                 self.ax = geomu.plot_polygon_boundaries(geom_to_plot["geom"],
@@ -472,14 +499,16 @@ class LayeredMap(Panel):
                                               inward_offset = geom_to_plot["inward_offset"],
                                               ax=self.ax,
                                               xlm = self.xlim,ylm = self.ylim,
-                                              rotation = self.rotation)
+                                              rotation = self.rotation,
+                                              axis_off = self.axis_off)
                 
             elif geom_to_plot["plot_type"] == "polygons": 
                 self.ax = geomu.plot_polygon_collection(geom_to_plot["geom"],
                                             rgb_faces = geom_to_plot["rgb_faces"], 
                                             ax = self.ax,
                                             xlm = self.xlim,ylm = self.ylim,
-                                            rotation = self.rotation)    
+                                            rotation = self.rotation,
+                                            axis_off = self.axis_off)    
             else: 
                 raise ValueError(f"Geometry plotting type: {geom_to_plot['plot_type']} not supported")
 
@@ -517,6 +546,7 @@ class Map(Panel):
         self.xlim = kwargs.get('xlim',V.lims['x'])
         self.ylim = kwargs.get('ylim',V.lims['y'])
         self.rotation = kwargs.get('rotation',None)
+        self.axis_off = kwargs.get('axis_off', True)  # Default to axis off
 
         # get the geom collection saved in appropriate TMG Geom
         self.geom_collection = self.V.TMG.Geoms[section_ix][geom_type].verts
@@ -535,13 +565,15 @@ class Map(Panel):
                                         rgb_edges = self.rgb_edges, 
                                         ax = self.ax,
                                         xlm = self.xlim,ylm = self.ylim,
-                                        rotation = self.rotation)
+                                        rotation = self.rotation,
+                                        axis_off = self.axis_off)
         else: 
             geomu.plot_polygon_collection(self.geom_collection,
                                           rgb_faces = self.rgb_faces,
                                           ax = self.ax,
                                           xlm = self.xlim,ylm = self.ylim,
-                                          rotation = self.rotation)
+                                          rotation = self.rotation,
+                                          axis_off = self.axis_off)
         
 
 class TypeMap(Map):

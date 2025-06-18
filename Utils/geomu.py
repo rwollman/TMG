@@ -451,7 +451,8 @@ def plot_polygon_collection(verts_or_polys,
                             alpha = 1,
                             background_color = (1,1,1), # defaults to white background
                             transpose = False,
-                            rotation = None):
+                            rotation = None,
+                            axis_off = True):
     """
     utility function that gets vertices (list of XYs) or polygons (list of shapley polygons)
     and plots them using matplotlib PolygonCollection. If polygons have holes, will "fake it" and plot the holes on top of the 
@@ -565,10 +566,11 @@ def plot_polygon_collection(verts_or_polys,
     else:
         ax.set_zlim(zlm[0],zlm[1])
 
-    ax.axis('off')
+    if axis_off:
+        ax.axis('off')
     return ax
 
-def plot_polygon_boundaries(verts_or_polys, rgb_edges=None, ax=None, xlm=None, ylm=None, transpose=False, rotation=None, linewidths=1, inward_offset=0):
+def plot_polygon_boundaries(verts_or_polys, rgb_edges=None, ax=None, xlm=None, ylm=None, transpose=False, rotation=None, linewidths=1, inward_offset=0, axis_off=True):
     """
     Plots only the boundaries of polygons using matplotlib LineCollection, with an option to draw lines inward.
 
@@ -636,7 +638,8 @@ def plot_polygon_boundaries(verts_or_polys, rgb_edges=None, ax=None, xlm=None, y
     ax.set_xlim(xlm)
     ax.set_ylim(ylm)
     ax.set_aspect('equal', 'box')
-    ax.axis('off')
+    if axis_off:
+        ax.axis('off')
 
     return ax
 
@@ -654,7 +657,7 @@ def rotation_matrix_degrees(angle_degrees):
     
     return rotation_matrix
 
-def plot_point_collection(pnts,sizes,rgb_faces = None,rgb_edges = None,ax = None,xlm=None,ylm = None,transpose = None, rotation = None):
+def plot_point_collection(pnts,sizes,rgb_faces = None,rgb_edges = None,ax = None,xlm=None,ylm = None,transpose = None, rotation = None, axis_off=True):
     # Create the PollyCollection from vertices and set face/edge colors
     assert rgb_edges is not None or rgb_faces is not None,"To plot either pleaes provide RGB array (nx3) for either edges or faces "
 
@@ -688,7 +691,8 @@ def plot_point_collection(pnts,sizes,rgb_faces = None,rgb_edges = None,ax = None
     ax.set_ylim(ylm[0],ylm[1])
 
     ax.set_aspect('equal', 'box')
-    ax.axis('off')
+    if axis_off:
+        ax.axis('off')
 
     mx = np.max(xy,axis=0)
     mn = np.min(xy,axis=0)
