@@ -36,7 +36,7 @@ from matplotlib.collections import LineCollection, PolyCollection, PatchCollecti
 from matplotlib.patches import Wedge, Circle
 from matplotlib.patches import Rectangle as pRectangle
 import colorcet as cc
-
+import math
 import umap
 import xycmap
 
