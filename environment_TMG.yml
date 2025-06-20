@@ -32,6 +32,9 @@ dependencies:
   # File format support
   - pyarrow  # For parquet file support
   
+  # Geometric analysis
+  - pycirclize  # For circle fitting and geometric analysis
+  
   # Utilities and progress
   - tqdm
   - joblib
