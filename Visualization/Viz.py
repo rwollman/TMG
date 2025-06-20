@@ -88,11 +88,20 @@ class View:
         """
         # Add all panels to figure
         for i in range(len(self.Panels)): 
-            # add an axes
-            if isinstance(self.Panels[i].pos,SubplotSpec):
-                ax = self.fig.add_subplot(self.Panels[i].pos)
-            else: 
-                ax = self.fig.add_axes(self.Panels[i].pos)
+            # Check if this panel requires polar axes
+            if hasattr(self.Panels[i], 'requires_polar') and self.Panels[i].requires_polar:
+                # Create polar axes for PolarPanel subclasses
+                if isinstance(self.Panels[i].pos, SubplotSpec):
+                    ax = self.fig.add_subplot(self.Panels[i].pos, projection='polar')
+                else: 
+                    ax = self.fig.add_axes(self.Panels[i].pos, projection='polar')
+            else:
+                # Create regular axes for standard panels
+                if isinstance(self.Panels[i].pos, SubplotSpec):
+                    ax = self.fig.add_subplot(self.Panels[i].pos)
+                else: 
+                    ax = self.fig.add_axes(self.Panels[i].pos)
+            
             self.Panels[i].ax = ax
             plt.sca(ax)
             self.Panels[i].plot()
@@ -155,55 +164,93 @@ class MultiSectionBasisView(View):
 
     
 
-def MultiSectionMapView(TMG, sections=None, level_type="cell", map_type="type", figsize='infer', n_columns=4,facecolor='white', **kwargs):
+class MultiSectionMapView(View):
     """
-    Creates a figure with multiple sections displayed in a grid layout.
-
-    Args:
-        TMG: The TissueMultiGraph object containing the data.
-        sections: A list of sections to display. If None, defaults to the first 24 sections.
-        level_type: The level of geometry to plot (e.g., "cell").
-        map_type: The type of map to create (e.g., "type").
-        figsize: The size of the overall figure.
-        **kwargs: Additional keyword arguments passed to the SingleMapView constructor.
+    A view that creates a figure with multiple sections displayed in a grid layout.
+    Each section gets its own subplot showing the specified map type.
     """
+    def __init__(self, TMG, sections=None, level_type="cell", map_type="type", 
+                 figsize='infer', n_columns=4, facecolor='white', **kwargs):
+        """
+        Create a multi-section map view.
 
-    # Determine sections to plot
-    if sections is None:
-        sections = TMG.unqS
-
-    num_cols = n_columns
-    num_rows = math.ceil(len(sections)/num_cols)
-    if figsize=='infer':
-        figsize = (num_cols*5,num_rows*3.5)
-    fig, axes = plt.subplots(num_rows, num_cols, figsize=figsize)
-    fig.patch.set_facecolor(facecolor)
-    axes = axes.ravel()
-    for ax in axes:
-        ax.axis('off')
-    # Iterate over sections and axes
-    for i, section in enumerate(sections):
-
-        # Create a SingleMapView for the current section
-        if map_type=='colorpleth':
-            val_to_map = TMG.Layers[0].get_feature_mat(section=section)[:,kwargs.get('basis',0)]
-            V = SingleMapView(TMG, section=section, level_type=level_type, map_type=map_type, **kwargs,val_to_map=val_to_map)
-        elif map_type=='type':
-            V = SingleMapView(TMG, section=section, level_type=level_type, map_type=map_type, **kwargs)
-
-        # Plot the map on the corresponding axis
-        V.show()
-        V.Panels[0].ax = axes[i]  # Assign the axis to the panel
-        V.Panels[0].plot()  # Replot on the assigned axis
-        plt.close(V.fig)
-
-        # Remove axis labels and ticks for cleaner appearances
-        axes[i].set_xticks([])
-        axes[i].set_yticks([])
-
-    # # Adjust layout for better spacing
-    # plt.tight_layout()
-    # plt.show()
+        Parameters
+        ----------
+        TMG : TissueMultiGraph
+            The TissueMultiGraph object containing the data.
+        sections : list, optional
+            A list of sections to display. If None, defaults to all sections in TMG.
+        level_type : str, default "cell"
+            The level of geometry to plot (e.g., "cell").
+        map_type : str, default "type"
+            The type of map to create (e.g., "type", "colorpleth", "random").
+        figsize : tuple or 'infer', default 'infer'
+            The size of the overall figure. If 'infer', calculates based on grid size.
+        n_columns : int, default 4
+            The number of columns in the plot grid.
+        facecolor : str, default 'white'
+            The face color of the figure.
+        **kwargs : dict
+            Additional keyword arguments passed to the individual map panels.
+        """
+        
+        # Determine sections to plot
+        if sections is None:
+            sections = TMG.unqS
+        
+        # Calculate grid layout
+        self.sections = sections
+        self.level_type = level_type
+        self.map_type = map_type
+        self.n_columns = n_columns
+        self.n_rows = math.ceil(len(sections) / n_columns)
+        self.kwargs = kwargs
+        
+        # Calculate figure size
+        if figsize == 'infer':
+            figsize = (self.n_columns * 5, self.n_rows * 3.5)
+        
+        # Initialize the View
+        super().__init__(TMG, f"Multi-Section {map_type.title()} Maps", figsize, facecolor)
+        
+        # Create grid spec for subplots
+        gs = self.fig.add_gridspec(self.n_rows, self.n_columns, wspace=0.01, hspace=0.01)
+        
+        # Create panels for each section
+        for i, section in enumerate(sections):
+            if i >= self.n_rows * self.n_columns:
+                break  # Don't exceed grid size
+                
+            row = i // self.n_columns
+            col = i % self.n_columns
+            
+            # Create the appropriate map panel for this section
+            if map_type == 'colorpleth':
+                val_to_map = TMG.Layers[0].get_feature_mat(section=section)[:, kwargs.get('basis', 0)]
+                geom_type = TMG.layer_to_geom_type_mapping[level_type]
+                panel = Colorpleth(val_to_map, geom_type=geom_type, V=self, section=section, 
+                                 name=f"{section}_colorpleth", pos=gs[row, col], **kwargs)
+            elif map_type == 'type':
+                geom_type = TMG.layer_to_geom_type_mapping[level_type]
+                panel = TypeMap(geom_type, V=self, section=section, 
+                              name=f"{section}_type", pos=gs[row, col], **kwargs)
+            elif map_type == 'random':
+                geom_type = TMG.layer_to_geom_type_mapping[level_type]
+                panel = RandomColorMap(geom_type, V=self, section=section,
+                                     name=f"{section}_random", pos=gs[row, col], **kwargs)
+            else:
+                raise ValueError(f"Unsupported map_type: {map_type}")
+    
+    def show(self):
+        """Display the multi-section view."""
+        super().show()
+        
+        # Clean up axes for all panels
+        for panel in self.Panels:
+            if panel.ax is not None:
+                panel.ax.set_xticks([])
+                panel.ax.set_yticks([])
+                panel.ax.set_title(panel.name.split('_')[0], fontsize=8)  # Use section name as title
 
 class SingleMapView(View):
     """
@@ -259,7 +306,129 @@ class SingleMapView(View):
         else: 
             raise ValueError(f"value {map_type} is not a recognized map_type")
 
-class UMAPwithSpatialMap(View):
+class MultiSectionScatterView(View):
+    """
+    A view that generates scatter plots for multiple sections in a grid layout.
+    Each scatter plot shows spatial coordinates colored by feature values.
+    """
+    def __init__(self, TMG, sections=None, layer=None, bit=None, n_columns=4, 
+                 facecolor='black', cmap='jet', global_contrast=True, 
+                 quantile=[0.05, 0.95], vmin=None, vmax=None, sort_order=True, s=0.01):
+        """
+        Create a multi-section scatter view.
+
+        Parameters
+        ----------
+        TMG : TissueMultiGraph
+            The TMG object containing the data to be plotted.
+        sections : list, optional
+            The sections to be plotted. If None, all unique sections in TMG will be plotted.
+        layer : str, optional
+            The layer of the TMG object to be used. If None, 'X' will be used.
+        bit : str or int, optional
+            The feature/bit to be used for coloring. If None, the first feature will be used.
+        n_columns : int, default 4
+            The number of columns in the plot grid.
+        facecolor : str, default 'black'
+            The face color of the plot.
+        cmap : str, default 'jet'
+            The color map to be used for the scatter plots.
+        global_contrast : bool, default True
+            Whether to use global contrast for the color scale. If False, local contrast will be used.
+        quantile : list, default [0.05, 0.95]
+            The percentiles to be used for calculating the vmin and vmax for the color scale.
+        vmin, vmax : float, optional
+            Explicit min/max values for color scaling. If None, calculated from quantiles.
+        sort_order : bool, default True
+            Whether to sort points by color value (helps with visualization).
+        s : float, default 0.01
+            Size of scatter plot points.
+        """
+        
+        # Store original X data to restore later
+        self.original_X = TMG.Layers[0].adata.X.copy()
+        
+        # Handle layer switching
+        if layer is not None:
+            TMG.Layers[0].adata.X = TMG.Layers[0].adata.layers[layer].copy()
+            self.layer = layer
+        else:
+            self.layer = 'X'
+        
+        # Handle bit selection
+        if bit is None:
+            bit = TMG.Layers[0].adata.var.index[0]
+        elif isinstance(bit, int):
+            bit = TMG.Layers[0].adata.var.index[bit]
+        else:
+            if bit not in TMG.Layers[0].adata.var.index:
+                raise ValueError(f"{bit} is not in the adata.var index.")
+        
+        self.bit = bit
+        
+        # Set text color based on face color
+        if facecolor == 'black':
+            textcolor = 'white'
+        else:
+            textcolor = 'black'
+        
+        # Determine sections to plot
+        if sections is None:
+            sections = TMG.unqS
+        
+        # Calculate grid layout
+        self.sections = sections
+        self.n_columns = n_columns
+        self.n_rows = math.ceil(len(sections) / n_columns)
+        
+        # Calculate figure size
+        figsize = (5 * n_columns, 3.5 * self.n_rows)
+        
+        # Initialize the View
+        super().__init__(TMG, f"Multi-Section Scatter: {self.layer} {bit}", figsize, facecolor)
+        
+        # Calculate global contrast values if needed
+        if global_contrast:
+            C_global = TMG.Layers[0].get_feature_mat()[:, np.isin(TMG.Layers[0].adata.var.index, [bit])]
+            if vmin is None:
+                vmin = np.quantile(C_global, quantile[0])
+            if vmax is None:
+                vmax = np.quantile(C_global, quantile[1])
+            
+            # Set figure title with global contrast info
+            self.fig.suptitle(f"{self.layer} {bit} vmin{vmin:.2f}|vmax{vmax:.2f}", 
+                            color=textcolor)
+        else:
+            self.fig.suptitle(f"{self.layer} {bit}", color=textcolor)
+        
+        # Create grid spec for subplots
+        gs = self.fig.add_gridspec(self.n_rows, self.n_columns, wspace=0.01, hspace=0.01)
+        
+        # Create panels for each section
+        for i, section in enumerate(sections):
+            if i >= self.n_rows * self.n_columns:
+                break  # Don't exceed grid size
+                
+            row = i // self.n_columns
+            col = i % self.n_columns
+            
+            # Create scatter panel for this section
+            panel = MultiSectionScatterPanel(
+                V=self, section=section, layer=self.layer, bit=bit,
+                cmap=cmap, global_contrast=global_contrast, quantile=quantile,
+                vmin=vmin, vmax=vmax, sort_order=sort_order, s=s,
+                textcolor=textcolor, name=f"scatter_{section}", pos=gs[row, col]
+            )
+    
+    def __del__(self):
+        """Restore original X data when view is destroyed."""
+        try:
+            if hasattr(self, 'original_X') and hasattr(self, 'TMG'):
+                self.TMG.Layers[0].adata.X = self.original_X
+        except:
+            pass  # Ignore errors during cleanup
+
+class UMAPwithSpatialMapView(View):
     """
     TODO: 
     1. add support multi-section
@@ -304,7 +473,7 @@ class UMAPwithSpatialMap(View):
         self.legend_ax.set_yticks([])
 
 
-class DapiValueDistributions(View):
+class DapiValueDistributionsView(View):
     def __init__(self,TMG,figsize = (16,8),min_dapi_line = None,max_dapi_line = None):
         super().__init__(TMG,name = "Dapi per section violin",figsize = figsize)
         if self.TMG.Nsections > 1:
@@ -329,7 +498,7 @@ class DapiValueDistributions(View):
             if self.max_dapi_line is not None: 
                 self.Panels[0].ax.axvline(self.max_dapi_line)
 
-class SumValueDistributions(View):
+class SumValueDistributionsView(View):
     def __init__(self,TMG,figsize = (16,8),min_sum_line = None,max_sum_line = None):
         super().__init__(TMG,name = "Log10 Sum per section violin",figsize = figsize)
         num_values = TMG.Layers[0].adata.X.sum(1)
@@ -358,7 +527,7 @@ class SumValueDistributions(View):
             if self.max_sum_line is not None: 
                 self.Panels[0].ax.axvline(self.max_sum_line)
 
-class ValueDistributions(View):
+class ValueDistributionsView(View):
     def __init__(self,TMG,num_values,log=False,title='',figsize = (16,8),min_line = None,max_line = None):
         super().__init__(TMG,name = title+" per section violin",figsize = figsize)
         if log:
@@ -405,7 +574,7 @@ class ValueDistributions(View):
 
 
 
-class LocalCellDensity(View):
+class LocalCellDensityView(View):
     """
     Creates a map of local cell density of a given section (or None for all)
     local density is estimated using k-nearest neighbors (default k=10)
@@ -424,6 +593,27 @@ class LocalCellDensity(View):
         local_dens = geomu.local_density(XY,k=k)
         
         Pmap = Colorpleth(local_dens,V=self,section = section,qntl = qntl,**kwargs)
+
+
+class CellCellInteractionView(View):
+    """
+    A view that creates a cell-cell interaction chord diagram for a specific section.
+    Automatically calculates interaction frequencies and displays them using pycirclize.
+    """
+    def __init__(self, TMG, section=None, figsize=(12, 12), **kwargs):
+        super().__init__(TMG, "Cell-Cell Interactions", figsize)
+        
+        # Set default section to be the first in unqS, useful if there is only single section
+        if section is None:
+            section = self.TMG.unqS[0]
+        
+        # Create the cell-cell interaction panel
+        interaction_panel = CellCellInteractions(
+            V=self, 
+            section=section, 
+            pos=(0, 0, 1, 1),  # Full figure
+            **kwargs
+        )
 
 
 class Panel(metaclass=abc.ABCMeta):
@@ -1044,155 +1234,351 @@ class Zoom(Panel):
         self.ax.set_xlim(self.zoom_coords[0],self.zoom_coords[0]+self.zoom_coords[2])
         self.ax.set_ylim(self.zoom_coords[1],self.zoom_coords[1]+self.zoom_coords[3])
 
-def frequency_table(df, col1_name, col2_name):
+
+
+class MultiSectionScatter(Panel):
     """
-    Creates a frequency table from a DataFrame based on two columns.
-
-    Args:
-        df (pd.DataFrame): The input DataFrame.
-        col1_name (str): The name of the column to use as indices.
-        col2_name (str): The name of the column to use as columns.
-
-    Returns:
-        pd.DataFrame: A frequency table with unique values of col1 as indices 
-                      and unique values of col2 as columns.
+    Panel that creates a scatter plot for a single section showing spatial coordinates 
+    colored by a feature value.
     """
-
-    # Extract unique values from each column
-    unique_col1 = np.unique(df[col1_name])
-    unique_col2 = np.unique(df[col2_name])
-
-    # Create an empty DataFrame with the specified index and columns
-    result_df = pd.DataFrame(index=unique_col1, columns=unique_col2)
-
-    # Iterate over unique values of col1
-    for val1 in unique_col1:
-        # Filter rows matching val1
-        filtered_df = df[df[col1_name] == val1]
-
-        # Count occurrences of unique values of col2 within the filtered rows
-        value_counts = filtered_df[col2_name].value_counts()
-
-        # Update the result DataFrame with the counts
-        result_df.loc[val1, value_counts.index] = value_counts.values
-    return result_df.fillna(0)  # Fill missing values with 0
-
-def MultiSectionScatter(TMG,sections=None,layer=None,bit=None,n_columns=4,facecolor='black',cmap='jet',global_contrast=True,quantile=[0.05,0.95],vmin=None,vmax=None,sort_order=True,s=0.01):
-    """
-    Generate a scatter plot for each section in the given TMG object.
-
-    Parameters
-    ----------
-    TMG : object
-        The TMG object containing the data to be plotted.
-    sections : list, optional
-        The sections to be plotted. If None, all unique sections in TMG will be plotted.
-    layer : str, optional
-        The layer of the TMG object to be used. If None, 'X' will be used.
-    bit : str, optional
-        The bit to be used. If None, the first index of the adata.var in the first layer of TMG will be used.
-    n_columns : int, optional
-        The number of columns in the plot grid. Default is 4.
-    facecolor : str, optional
-        The face color of the plot. Default is 'black'.
-    cmap : str, optional
-        The color map to be used for the scatter plots. Default is 'jet'.
-    global_contrast : bool, optional
-        Whether to use global contrast for the color scale. If False, local contrast will be used. Default is True.
-    percentile : list, optional
-        The percentiles to be used for calculating the vmin and vmax for the color scale. Default is [5, 95].
-
-    Returns
-    -------
-    None
-
-    """
-    set_vmin = vmin
-    set_vmax = vmax
-
-    # If layer is not None, copy the corresponding layer to adata.X
-    X = TMG.Layers[0].adata.X.copy()
-    if not isinstance(layer,type(None)):
-        TMG.Layers[0].adata.X = TMG.Layers[0].adata.layers[layer].copy()
-    else:
-        layer = 'X'
-
-    # If bit is None, set it to the first index of the adata.var in the first layer of TMG
-    if isinstance(bit,type(None)):
-        bit = TMG.Layers[0].adata.var.index[0]
-    elif isinstance(bit,int):
-        bit = TMG.Layers[0].adata.var.index[bit]
-    else:
-        if not bit in TMG.Layers[0].adata.var.index:
-            print(f"{bit} is not in the adata.var index.")
-            return
-
-    # Set the text color based on the face color
-    if facecolor=='black':
-        textcolor='white'
-    else:
-        textcolor='black'
-
-    # If sections is None, set it to the unique sections in TMG
-    if isinstance(sections,type(None)):
-        sections = TMG.unqS
-
-    # Calculate the number of rows for the plot
-    n_rows = math.ceil(len(sections)/n_columns)
-
-    # Set the figure size
-    figsize = (5*n_columns, 3.5*n_rows)
-
-    # Create a subplot with the calculated number of rows and columns
-    fig, axs = plt.subplots(n_rows, n_columns, figsize=figsize)
-
-    # Set the face color of the figure
-    fig.patch.set_facecolor(facecolor)
-
-    # Flatten the axes array
-    axs = axs.flatten()
-
-    # If global_contrast is True, calculate the vmin and vmax for the color scale
-    if global_contrast:
-        C = TMG.Layers[0].get_feature_mat()[:,np.isin(TMG.Layers[0].adata.var.index,[bit])]
-        if not isinstance(set_vmin,type(None)):
-            vmin = set_vmin
-        else:
-            vmin = np.quantile(C,quantile[0])
-        if not isinstance(set_vmax,type(None)):
-            vmax = set_vmax
-        else:
-            vmax = np.quantile(C,quantile[1])
-        fig.suptitle(f"{layer} {bit} vmin{vmin:.2f}|vmax{vmax:.2f}",color=textcolor)
-    else:
-        fig.suptitle(f"{layer} {bit}",color=textcolor)
-
-    # Turn off the axis for each subplot
-    for ax in axs:
-        ax.axis('off')
-
-    # For each section, plot the scatter plot
-    for i, section in enumerate(sections):
-        ax = axs[i]
-        XY = TMG.Layers[0].get_XY(section=section)
-        C = TMG.Layers[0].get_feature_mat(section=section)[:,np.isin(TMG.Layers[0].adata.var.index,[bit])].ravel()
+    def __init__(self, V, section, layer, bit, cmap='jet', global_contrast=True, 
+                 quantile=[0.05, 0.95], vmin=None, vmax=None, sort_order=True, s=0.01, 
+                 textcolor='white', name=None, pos=(0,0,1,1)):
+        super().__init__(V, name or f"scatter_{section}", pos)
+        
+        self.section = section
+        self.layer = layer
+        self.bit = bit
+        self.cmap = cmap
+        self.global_contrast = global_contrast
+        self.quantile = quantile
+        self.vmin = vmin
+        self.vmax = vmax
+        self.sort_order = sort_order
+        self.s = s
+        self.textcolor = textcolor
+        
+        # Get data for this section
+        self.XY = self.V.TMG.Layers[0].get_XY(section=section)
+        self.C = self.V.TMG.Layers[0].get_feature_mat(section=section)[:, 
+                 np.isin(self.V.TMG.Layers[0].adata.var.index, [bit])].ravel()
+        
+        # Calculate local contrast if needed
         if not global_contrast:
-            if not isinstance(set_vmin,type(None)):
-                vmin = set_vmin
-            else:
-                vmin = np.quantile(C,quantile[0])
-            if not isinstance(set_vmax,type(None)):
-                vmax = set_vmax
-            else:
-                vmax = np.quantile(C,quantile[1])
-        if sort_order:
-            order = np.argsort(C)
+            if vmin is None:
+                self.vmin = np.quantile(self.C, quantile[0])
+            if vmax is None:
+                self.vmax = np.quantile(self.C, quantile[1])
+    
+    def plot(self):
+        """Plot the scatter plot for this section."""
+        if self.sort_order:
+            order = np.argsort(self.C)
         else:
-            order = np.array(range(C.shape[0]))
-        ax.scatter(XY[order,0], XY[order,1], c=C[order], s=s,cmap=cmap,vmin=vmin,vmax=vmax)
-        if not global_contrast:
-            ax.set_title(f"{section} {vmin:.2f}|{vmax:.2f}",color=textcolor)
+            order = np.array(range(self.C.shape[0]))
+        
+        scatter = self.ax.scatter(self.XY[order, 0], self.XY[order, 1], 
+                                c=self.C[order], s=self.s, cmap=self.cmap, 
+                                vmin=self.vmin, vmax=self.vmax)
+        
+        # Set title
+        if not self.global_contrast:
+            title = f"{self.section} {self.vmin:.2f}|{self.vmax:.2f}"
         else:
-            ax.set_title(f"{section}",color=textcolor)
+            title = f"{self.section}"
+        
+        self.ax.set_title(title, color=self.textcolor, fontsize=8)
+        self.ax.set_xticks([])
+        self.ax.set_yticks([])
+        self.ax.axis('off')
 
-    TMG.Layers[0].adata.X = X.copy()
+
+
+
+class PolarPanel(Panel):
+    """
+    Base class for panels that require polar axes instead of regular matplotlib axes.
+    
+    This class handles the creation and management of polar axes, which are required
+    by certain visualization libraries like pycirclize. It properly integrates with
+    the Panel system by creating a polar subplot within the Panel's position.
+    """
+    def __init__(self, V=None, name=None, pos=(0,0,1,1)):
+        # Initialize the base Panel first
+        super().__init__(V, name, pos)
+        
+        # We'll create the polar axes during the View.show() process
+        # The ax will be set to a PolarAxes object instead of regular Axes
+        self.requires_polar = True
+    
+    def create_polar_axes(self, fig, pos):
+        """
+        Create polar axes for this panel.
+        
+        This method should be called by the View during the show() process
+        to create the appropriate polar axes.
+        
+        Parameters
+        ----------
+        fig : matplotlib.figure.Figure
+            The figure to add the polar axes to
+        pos : tuple or SubplotSpec
+            Position specification for the axes
+            
+        Returns
+        -------
+        matplotlib.projections.polar.PolarAxes
+            The created polar axes
+        """
+        if isinstance(pos, SubplotSpec):
+            ax = fig.add_subplot(pos, projection='polar')
+        else:
+            ax = fig.add_axes(pos, projection='polar')
+        return ax
+
+
+class CellCellInteractions(PolarPanel):
+    """
+    Creates a chord diagram showing cell-cell interaction frequencies between different cell types.
+    Uses pycirclize to generate the visualization with colors matching the TMG taxonomy.
+    
+    This Panel properly uses polar axes as required by pycirclize, inheriting from PolarPanel
+    to handle the polar axes creation correctly.
+    """
+    def __init__(self, V=None, section=None, name="Cell-Cell Interactions", pos=(0,0,1,1), 
+                 min_interactions=5, max_cell_types=20, space=3, **kwargs):
+        super().__init__(V, name, pos)
+        
+        # Set default section to be the first in unqS, useful if there is only single section
+        if section is None:
+            section = self.V.TMG.unqS[0]
+        
+        self.section = section
+        self.min_interactions = min_interactions  # Minimum interactions to include a cell type
+        self.max_cell_types = max_cell_types      # Maximum cell types to show for clarity
+        self.space = space                        # Space between sectors in degrees
+        
+        # Store additional pycirclize parameters
+        self.label_kws = kwargs.get('label_kws', {'r': 110, 'size': 10, 'orientation': 'vertical'})
+        self.link_kws = kwargs.get('link_kws', {'ec': 'gray', 'lw': 0.3, 'alpha': 0.7})
+        
+        # Calculate frequency matrix and extract cell type information
+        self._calculate_interaction_matrix()
+        self._extract_cell_type_colors()
+        
+    def _calculate_interaction_matrix(self):
+        """Calculate the cell-cell interaction frequency matrix using TMG's built-in method."""
+        print(f"🔍 Calculating interaction matrix for section {self.section}")
+        
+        # Find the cell layer (layer 0 typically contains cells)
+        cell_layer = self.V.TMG.Layers[0]
+        
+        # Get the taxonomy for proper type mapping
+        cell_layer_idx = 0  # Assuming cells are in layer 0
+        taxonomy_idx = self.V.TMG.layer_taxonomy_mapping.get(cell_layer_idx, 0)
+        taxonomy = self.V.TMG.Taxonomies[taxonomy_idx]
+        
+        try:
+            # Use the built-in type_neighbor_frequency method
+            freq_matrix, types_used = cell_layer.type_neighbor_frequency(taxonomy=taxonomy)
+            
+            # If we're filtering by section, we need to recalculate for just that section
+            if self.section is not None:
+                # Get section-specific edges by filtering the spatial graph
+                edge_list = cell_layer.spatial_edge_list
+                section_mask = cell_layer.Section == self.section
+                
+                if section_mask.sum() == 0:
+                    raise ValueError(f"No cells found in section {self.section}")
+                
+                # Filter edges to only include those within the specified section
+                section_indices = np.where(section_mask)[0]
+                edge_mask = np.isin(edge_list, section_indices).all(axis=1)
+                section_edges = edge_list[edge_mask]
+                
+                if len(section_edges) == 0:
+                    print("Warning: No spatial edges found within the specified section")
+                    # Create empty matrix
+                    freq_matrix = np.zeros_like(freq_matrix)
+                else:
+                    # Recalculate frequency matrix for section-specific edges
+                    node_types = cell_layer.Type
+                    type_pairs = np.column_stack([node_types[section_edges[:, 0]], 
+                                                node_types[section_edges[:, 1]]])
+                    
+                    # Reset frequency matrix and recalculate
+                    freq_matrix = np.zeros_like(freq_matrix)
+                    np.add.at(freq_matrix, (type_pairs[:, 0], type_pairs[:, 1]), 1)
+            
+            self.Data['freq_matrix'] = freq_matrix
+            self.unique_types = types_used
+            
+            print(f"✓ Calculated interaction matrix: {freq_matrix.shape} "
+                  f"with {np.count_nonzero(freq_matrix)} non-zero interactions")
+            
+        except Exception as e:
+            print(f"Error using type_neighbor_frequency method: {e}")
+            raise ValueError(f"Could not calculate interaction matrix: {e}")
+    
+    def _extract_cell_type_colors(self):
+        """Extract cell type names and RGB colors from TMG taxonomy."""
+        # Find the appropriate taxonomy
+        cell_layer_idx = 0  # Assuming cells are in layer 0
+        taxonomy_idx = self.V.TMG.layer_taxonomy_mapping.get(cell_layer_idx, 0)
+        taxonomy = self.V.TMG.Taxonomies[taxonomy_idx]
+        
+        # Extract cell type names and colors
+        self.Data['cell_type_names'] = []
+        self.Data['cell_type_colors'] = {}
+        
+        for i, type_id in enumerate(self.unique_types):
+            try:
+                # Get the actual cell type name from taxonomy
+                cell_name = taxonomy.Type[type_id]
+                self.Data['cell_type_names'].append(cell_name)
+                
+                # Get RGB color and convert to matplotlib format (0-1 range)
+                rgb_values = taxonomy.RGB[type_id]
+                
+                # Handle different RGB data formats
+                if hasattr(rgb_values, '__len__') and len(rgb_values) >= 3:
+                    # Convert from 0-255 to 0-1 range if needed
+                    if np.max(rgb_values) > 1:
+                        color_tuple = tuple(c/255.0 for c in rgb_values[:3])
+                    else:
+                        color_tuple = tuple(rgb_values[:3])
+                else:
+                    # Fallback to gray if RGB extraction fails
+                    color_tuple = (0.5, 0.5, 0.5)
+                
+                self.Data['cell_type_colors'][cell_name] = color_tuple
+                
+            except (IndexError, KeyError, AttributeError):
+                # Fallback naming and coloring
+                cell_name = f"Type_{type_id}"
+                self.Data['cell_type_names'].append(cell_name)
+                # Use a default color scheme
+                color_val = i / len(self.unique_types)
+                self.Data['cell_type_colors'][cell_name] = plt.cm.Set3(color_val)[:3]
+    
+    def plot(self):
+        """Create and plot the chord diagram using pycirclize with proper polar axes."""
+        print("🔍 CellCellInteractions.plot() called")
+        
+        try:
+            import pandas as pd
+            from pycirclize import Circos
+            print("✓ Successfully imported pycirclize and dependencies")
+            
+            # Verify we have polar axes
+            from matplotlib.projections.polar import PolarAxes
+            if not isinstance(self.ax, PolarAxes):
+                raise ValueError(f"Expected PolarAxes, got {type(self.ax)}. "
+                               "Make sure the View properly creates polar axes for PolarPanel subclasses.")
+            
+            # Get the data
+            freq_matrix = self.Data['freq_matrix']
+            cell_type_names = self.Data['cell_type_names']
+            cell_type_colors = self.Data['cell_type_colors']
+            
+            # Print basic statistics
+            print(f"Matrix shape: {freq_matrix.shape}")
+            print(f"Matrix sum: {freq_matrix.sum()}")
+            print(f"Non-zero elements: {np.count_nonzero(freq_matrix)}")
+            print(f"Cell types: {len(cell_type_names)}")
+            
+            # Filter out cell types with very few interactions
+            row_sums = freq_matrix.sum(axis=1)
+            col_sums = freq_matrix.sum(axis=0)
+            total_interactions = row_sums + col_sums
+            
+            # Keep only cell types with sufficient interactions
+            keep_mask = total_interactions >= self.min_interactions
+            
+            if keep_mask.sum() == 0:
+                print("Warning: No cell types meet minimum interaction threshold. Using all types.")
+                keep_mask = np.ones(len(cell_type_names), dtype=bool)
+            
+            # Further limit to top interacting cell types if too many
+            if keep_mask.sum() > self.max_cell_types:
+                keep_indices = np.where(keep_mask)[0]
+                top_indices = keep_indices[np.argsort(total_interactions[keep_indices])[-self.max_cell_types:]]
+                keep_mask = np.zeros(len(cell_type_names), dtype=bool)
+                keep_mask[top_indices] = True
+            
+            # Filter data
+            filtered_matrix = freq_matrix[np.ix_(keep_mask, keep_mask)]
+            filtered_names = [cell_type_names[i] for i in range(len(cell_type_names)) if keep_mask[i]]
+            filtered_colors = {name: cell_type_colors[name] for name in filtered_names}
+            
+            print(f"Using {len(filtered_names)} cell types after filtering")
+            print(f"Filtered matrix sum: {filtered_matrix.sum()}")
+            
+            # Check if we have any interactions to plot
+            if filtered_matrix.sum() == 0:
+                self._plot_no_data_message("No interactions found after filtering")
+                return
+            
+            # Create DataFrame for pycirclize
+            matrix_df = pd.DataFrame(filtered_matrix, index=filtered_names, columns=filtered_names)
+            print(f"Created DataFrame: {matrix_df.shape}")
+            
+            # Now we can use pycirclize properly with our polar axes
+            print("Creating chord diagram using Circos.chord_diagram and plotting on provided polar axes...")
+            
+            # Use the chord_diagram static method to create the Circos object properly
+            circos = Circos.chord_diagram(
+                matrix_df,
+                space=self.space,
+                cmap=filtered_colors,
+                label_kws=self.label_kws,
+                link_kws=self.link_kws
+            )
+            
+            # Plot on our provided polar axes
+            circos.plotfig(ax=self.ax)
+            
+            print("✓ Successfully created chord diagram on polar axes")
+            
+            # Add title and summary statistics
+            total_interactions = filtered_matrix.sum()
+            n_types = len(filtered_names)
+            
+            
+            print("✓ CellCellInteractions.plot() completed successfully")
+                
+        except ImportError:
+            print("Error: pycirclize not available. Please install with: pip install pycirclize")
+            self._plot_error_message('pycirclize not available\nPlease install: pip install pycirclize')
+            
+        except Exception as e:
+            print(f"Unexpected error in chord diagram creation: {e}")
+            import traceback
+            traceback.print_exc()
+            self._plot_error_message(f'Chord Diagram Error:\n{str(e)}')
+    
+    def _plot_no_data_message(self, message):
+        """Plot a message when no data is available."""
+        # Clear the polar axes and add text
+        self.ax.clear()
+        self.ax.text(0.5, 0.5, message,
+                   ha='center', va='center', transform=self.ax.transAxes,
+                   bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8),
+                   fontsize=12)
+        # Hide polar axes elements
+        self.ax.set_rticks([])
+        self.ax.set_thetagrids([])
+    
+    def _plot_error_message(self, message):
+        """Plot an error message."""
+        # Clear the polar axes and add text
+        self.ax.clear()
+        self.ax.text(0.5, 0.5, message, 
+                   ha='center', va='center', transform=self.ax.transAxes,
+                   bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.8),
+                   fontsize=10)
+        # Hide polar axes elements
+        self.ax.set_rticks([])
+        self.ax.set_thetagrids([])
+
+
