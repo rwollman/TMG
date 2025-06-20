@@ -974,8 +974,8 @@ class TissueMultiGraph:
                 layer._spatial_edge_list = None
                 
             # Clear cached KNN objects
-            if hasattr(layer, 'SG_knn'):
-                layer.SG_knn = None
+            if hasattr(layer, '_SG_knn'):
+                layer._SG_knn = None
         
         # Update cached unique sections
         self._unqS = None
@@ -1122,6 +1122,190 @@ class TissueMultiGraph:
             self.geom_to_layer_type_mapping['cell'] = 'cell'
             self.layer_to_geom_type_mapping['cell'] = 'cell'
 
+    def extract_sections(self, sections, basepath=None, save_extracted=True):
+        """
+        Extract one or more sections and create a new TMG object containing only that section data.
+        
+        This method creates a completely new TMG object with filtered data from the specified sections.
+        All layers, taxonomies, and geometries are properly handled to maintain data integrity.
+        
+        Parameters
+        ----------
+        sections : str or list of str
+            Section name(s) to extract. Can be a single section name or list of section names.
+        basepath : str, optional
+            Path where the new TMG should be saved. If None, uses self.basepath + '_extracted'
+        save_extracted : bool, default True
+            Whether to save the extracted TMG object after creation
+            
+        Returns
+        -------
+        TissueMultiGraph
+            New TMG object containing only the specified section(s)
+            
+        Examples
+        --------
+        >>> # Extract a single section
+        >>> new_tmg = TMG.extract_sections('section_01')
+        
+        >>> # Extract multiple sections
+        >>> new_tmg = TMG.extract_sections(['section_01', 'section_02'])
+        
+        >>> # Extract to a specific path without saving
+        >>> new_tmg = TMG.extract_sections('section_01', basepath='/path/to/new/tmg', save_extracted=False)
+        """
+        
+        # Convert single section to list for consistent processing
+        if isinstance(sections, str):
+            sections = [sections]
+        
+        # Validate that all requested sections exist
+        available_sections = set(self.unqS)
+        requested_sections = set(sections)
+        missing_sections = requested_sections - available_sections
+        
+        if missing_sections:
+            raise ValueError(f"Requested sections not found: {missing_sections}. "
+                           f"Available sections: {list(available_sections)}")
+        
+        self.update_user(f"Extracting sections: {sections}")
+        
+        # Set up basepath for the new TMG
+        if basepath is None:
+            basepath = self.basepath + '_extracted'
+        
+        # Create filter mask for the requested sections
+        section_mask = np.isin(self.Layers[0].Section, sections)
+        n_cells_extracted = np.sum(section_mask)
+        
+        self.update_user(f"Extracting {n_cells_extracted} cells from {len(sections)} section(s)")
+        
+        # Create new TMG object
+        extracted_tmg = TissueMultiGraph(basepath=basepath, redo=True, mem_only=not save_extracted)
+        
+        # Copy basic configuration
+        extracted_tmg.input_df = self.input_df.copy()
+        extracted_tmg.geom_to_layer_type_mapping = self.geom_to_layer_type_mapping.copy()
+        extracted_tmg.layer_to_geom_type_mapping = self.layer_to_geom_type_mapping.copy()
+        
+        # Copy and update taxonomies (taxonomies are not section-specific)
+        extracted_tmg.Taxonomies = []
+        for tax in self.Taxonomies:
+            # Create a copy of the taxonomy for the new TMG
+            new_tax = Taxonomy(name=tax.name, basepath=basepath)
+            new_tax.adata = tax.adata.copy()
+            extracted_tmg.Taxonomies.append(new_tax)
+        
+        # Copy layer taxonomy mapping
+        extracted_tmg.layer_taxonomy_mapping = self.layer_taxonomy_mapping.copy()
+        
+        # Extract and filter each layer
+        extracted_tmg.Layers = []
+        for layer_idx, layer in enumerate(self.Layers):
+            self.update_user(f"Extracting layer {layer_idx} ({layer.layer_type})")
+            
+            # Filter the layer's anndata object
+            filtered_adata = layer.adata[section_mask].copy()
+            
+            # Create new TissueGraph with filtered data
+            new_layer = TissueGraph(
+                adata=filtered_adata,
+                basepath=basepath,
+                layer_type=layer.layer_type,
+                redo=True
+            )
+            
+            # Copy layer-specific settings
+            new_layer.adata_mapping = layer.adata_mapping.copy()
+            
+            extracted_tmg.Layers.append(new_layer)
+        
+        # Copy layers graph (relationships between layers)
+        extracted_tmg.layers_graph = self.layers_graph.copy()
+        
+        # Handle geometries if they exist
+        if hasattr(self, 'Geoms') and self.Geoms is not None:
+            self.update_user("Extracting geometries...")
+            extracted_tmg.Geoms = [None] * len(sections)
+            
+            # Map section names to their indices in the original TMG
+            section_to_idx = {section: idx for idx, section in enumerate(self.unqS)}
+            
+            for new_idx, section in enumerate(sections):
+                if section in section_to_idx:
+                    orig_idx = section_to_idx[section]
+                    if orig_idx < len(self.Geoms) and self.Geoms[orig_idx] is not None:
+                        # Copy geometries for this section
+                        section_geoms = {}
+                        for geom_type, geom_obj in self.Geoms[orig_idx].items():
+                            if geom_obj is not None:
+                                # Create new geometry object
+                                new_geom = Geom(
+                                    geom_type=geom_type,
+                                    polys=None,  # Will be loaded/filtered below
+                                    basepath=basepath,
+                                    section=section
+                                )
+                                
+                                # Filter polygons to match the filtered cells
+                                if geom_obj.polys is not None:
+                                    # Get the indices of cells from this section
+                                    section_cell_mask = self.Layers[0].Section == section
+                                    section_indices = np.where(section_cell_mask)[0]
+                                    
+                                    # Filter to only the cells we're keeping
+                                    final_mask = section_mask[section_cell_mask]
+                                    
+                                    if len(geom_obj.polys) == np.sum(section_cell_mask):
+                                        # Geometry has one polygon per cell in section
+                                        filtered_polys = [geom_obj.polys[i] for i in range(len(geom_obj.polys)) if final_mask[i]]
+                                        new_geom.polys = filtered_polys
+                                    else:
+                                        self.update_user(f"Warning: geometry {geom_type} size mismatch for section {section}")
+                                        # Try to load from file instead
+                                        try:
+                                            all_polys = fileu.load_polygon_list(geom_obj.filename)
+                                            if len(all_polys) == np.sum(section_cell_mask):
+                                                filtered_polys = [all_polys[i] for i in range(len(all_polys)) if final_mask[i]]
+                                                new_geom.polys = filtered_polys
+                                        except Exception as e:
+                                            self.update_user(f"Could not load geometry {geom_type} for section {section}: {e}")
+                                
+                                section_geoms[geom_type] = new_geom
+                        
+                        extracted_tmg.Geoms[new_idx] = section_geoms
+        
+        # Update the internal section tracking
+        extracted_tmg._unqS = None  # Will be recalculated from data
+        
+        # Rebuild spatial graphs if they existed in the original TMG
+        self.update_user("Checking and rebuilding spatial graphs...")
+        for layer_idx, (orig_layer, new_layer) in enumerate(zip(self.Layers, extracted_tmg.Layers)):
+            if orig_layer.SG is not None:
+                self.update_user(f"Rebuilding spatial graph for layer {layer_idx} ({new_layer.layer_type})")
+                try:
+                    # Check if original had KNN objects saved
+                    save_knn = hasattr(orig_layer, '_SG_knn') and orig_layer._SG_knn is not None
+                    new_layer.build_spatial_graph(save_knn=save_knn)
+                    self.update_user(f"✓ Successfully rebuilt spatial graph for layer {layer_idx}")
+                except Exception as e:
+                    self.update_user(f"Warning: Could not rebuild spatial graph for layer {layer_idx}: {e}")
+            else:
+                self.update_user(f"No spatial graph found for layer {layer_idx} ({new_layer.layer_type}) - skipping")
+        
+        # Save the extracted TMG if requested
+        if save_extracted:
+            self.update_user("Saving extracted TMG...")
+            try:
+                extracted_tmg.save()
+                self.update_user(f"Successfully saved extracted TMG to {basepath}")
+            except Exception as e:
+                self.update_user(f"Warning: Could not save extracted TMG: {e}")
+        
+        self.update_user(f"Section extraction completed. New TMG has {extracted_tmg.Nsections} sections: {extracted_tmg.unqS}")
+        
+        return extracted_tmg
+
 class TissueGraph:
     """Representation of transcriptional state of biospatial units as a graph. 
     
@@ -1186,7 +1370,9 @@ class TissueGraph:
                     datefmt='%Y %B %d %H:%M:%S',level=logging.INFO, force=True)
         self.log = logging.getLogger("Analysis")
         self.verbose = True
- 
+        self._spatial_edge_list = None
+        self._SG_knn = None  # Private attribute to store actual SG_knn data
+
         # this dict stores the defaults field names in the anndata objects that maps to TissueGraph properties
         # this allows storing different versions (i.e. different cell type assignment) in the anndata object 
         # while still maintaining a "clean" interfact, i.e. i can still call for TG.Type and get a type vector without 
@@ -1205,15 +1391,15 @@ class TissueGraph:
         # Key graphs - spatial and feature based
         self.SG = None # spatial graph (created by build_spatial_graph, or load in __init__)
         self.FG = dict() # Feature graph (created by build_feature_graph, or load in __init__)
-        self._spatial_edge_list = None # for performance (of .contract_graph), going to save the edge list extermally from self.SG 
 
         # there are two mode of TG loading: 
         # 1. standard (from drive): load the full adata and create SG and FG 
         # 2. from scratch : uses input arguments to rebuild the TG object from scratch, ignores anything in the drive. 
-        
-        if not redo:
+
+        # load data from existing h5ad file
+        if not redo and self.basepath is not None and os.path.exists(os.path.join(self.basepath, 'Layer', f"{layer_type}_layer.h5ad")):
             layer_path = os.path.join(self.basepath, 'Layer')
-            self.adata = anndata.read_h5ad(os.path.join(layer_path,f"{self.layer_type}_layer.h5ad"))
+            self.adata = anndata.read_h5ad(os.path.join(layer_path,f"{layer_type}_layer.h5ad"))
             
             if 'adata_mapping' in self.adata.uns:
                 self.adata_mapping = self.adata.uns["adata_mapping"]
@@ -1237,10 +1423,10 @@ class TissueGraph:
                     filename = os.path.join(layer_path,self.adata.uns["SG_knn"])
                     with open(filename,'rb') as file: 
                         knn = pickle.load(file)
-                    self.SG_knn = knn
+                    self._SG_knn = knn
                 except Exception:
                     self.update_user("Failed to load SG_knn - please check")
-                    self.SG_knn = None
+                    self._SG_knn = None
 
             for key in self.adata.uns.keys():
                 if key.startswith("FG_") and key.endswith("_knn"):
@@ -1311,14 +1497,14 @@ class TissueGraph:
 
         # rebuild igraph layers (that are only saved as adj matrix within anndata)
         if rebuild_SG and self.SG != None: 
-            if not hasattr(self, 'SG_knn') or self.SG_knn is None:
+            if not hasattr(self, '_SG_knn') or self._SG_knn is None:
                 self.build_spatial_graph()
             else:
                 self.build_spatial_graph(save_knn=True)
         else:
             # after filtering, need to rebuild SG, if it existed (and rebuild_SG was False) zeros it out
             self.SG = None
-            self.SG_knn = None
+            self._SG_knn = None
         
         self.FG = dict()
 
@@ -1330,11 +1516,11 @@ class TissueGraph:
         layer_path = os.path.join(self.basepath, 'Layer')
         if not os.path.exists(layer_path):
             os.makedirs(layer_path)
-        if hasattr(self, 'SG_knn'):
+        if hasattr(self, '_SG_knn') and self._SG_knn is not None:
             filename =  f"{self.layer_type}_SG_knn.pkl" # 
             fullfilename = os.path.join(layer_path,filename)
             with open(fullfilename, 'wb') as file:
-                pickle.dump(self.SG_knn,file)
+                pickle.dump(self._SG_knn,file)
             self.adata.uns["SG_knn"] = filename
         for g in self.FG.keys():
             if 'knn' in self.FG[g]:
@@ -1717,11 +1903,11 @@ class TissueGraph:
         # building KNN objects in the same way that the grpah was build, per section
         if save_knn:
             self.update_user("building knn query object")
-            self.SG_knn = list()
+            self._SG_knn = list()
             for s in self.unqS: 
                 XY_per_section = self.XY[self.Section==s,:]
                 _,knn = tmgu.build_knn_graph(XY_per_section,'euclidean')
-                self.SG_knn.append(knn)
+                self._SG_knn.append(knn)
         self.update_user("done building spatial graph")
 
 
@@ -1827,17 +2013,24 @@ class TissueGraph:
             # use weighted bincount to calc XY fast
             newX = np.bincount(IxMapping,weights = self.XY[:,0]) / ZoneSize
             newY = np.bincount(IxMapping,weights = self.XY[:,1]) / ZoneSize
-            newZ = np.bincount(IxMapping,weights = self.Z) / ZoneSize
             new_XY = np.zeros((len(newX),2))
             new_XY[:,0] = newX
             new_XY[:,1] = newY
+            
+            # Handle Z coordinate if it exists
+            try:
+                if self.Z is not None:
+                    newZ = np.bincount(IxMapping,weights = self.Z) / ZoneSize
+                    ZoneGraph.Z = newZ
+            except (ValueError, KeyError):
+                # Z coordinate doesn't exist or mapping is broken - skip it
+                pass
         
             # assigne seciton name using unique indexes
             _,unq_ix = np.unique(IxMapping, return_index = True)
             new_section = list(self.Section[unq_ix])
 
             ZoneGraph.XY = new_XY
-            ZoneGraph.Z = newZ
             ZoneGraph.Section = new_section
             
 
@@ -1894,18 +2087,49 @@ class TissueGraph:
         else: 
             return(cond_entropy)
     
-    def extract_environments(self,ordr = None,typevec = None, k=None, N = None, weights = None):
+    def extract_environments(self,ordr = None,typevec = None, k=None, N = None, weights = None, section = None, cache_results = False):
         """returns the categorical distribution of neighbors. 
         
         Depending on input there could be two uses, 
             usage 1: if ordr is not None returns local neighberhood defined as nodes up to distance ordr on the graph for all vertices. 
             usage 2: if typevec is not None returns local env based on typevec, will return one env for each unique type in typevec
             usage 3: if k is not None, calcualte knn spatially per section and then calculate env based on that. 
+        
+        Parameters
+        ----------
+        ordr : int, optional
+            Order of neighborhood for graph-based environments
+        typevec : array-like, optional  
+            Type vector for type-based environments
+        k : int, optional
+            Number of nearest neighbors for spatial KNN environments
+        N : int, optional
+            Number of types (for k-based method)
+        weights : array-like, optional
+            Weights for distance-based calculations (for k-based method)
+        section : str or int, optional
+            If provided, only compute environments for cells in this specific section
+        cache_results : bool, optional (default: False)
+            If True, save/load results to/from disk for faster subsequent calls.
+            Only applies to KNN-based environments (k parameter). Caching is disabled
+            when weights are provided.
+            
         Return
         ------
         numpy array
             Array with Type frequency for all local environments for all types in TG. 
+            If section is specified, only returns environments for cells in that section.
         """
+        # Apply section filter if specified
+        if section is not None:
+            section_mask = self.Section == section
+            if not np.any(section_mask):
+                raise ValueError(f"Section '{section}' not found in data. Available sections: {list(self.unqS)}")
+            section_indices = np.flatnonzero(section_mask)
+        else:
+            section_mask = None
+            section_indices = None
+            
         unqlbl = np.unique(self.Type)
         
         if sum(x is not None for x in [ordr, typevec, k]) != 1:
@@ -1916,31 +2140,72 @@ class TissueGraph:
         # if we use ordr this is neighborhood defined by iGraph
         # if we provide types, than indexes of each type. 
         if ordr is not None:
-            # ind = self.SG.neighborhood(order = ordr)
-            ind = tmgu.find_graph_neighborhoold_parallel_by_components(self.SG,ordr)
+            # Use original iGraph neighborhood method for compatibility
+            ind = self.SG.neighborhood(order = ordr)
+            # Filter neighborhoods to only include those starting from nodes in the specified section
+            if section is not None:
+                ind = [ind[i] for i in section_indices]
         elif typevec is not None:
             ind = list()
             for i in range(len(np.unique(typevec))):
-                ind.append(np.flatnonzero(typevec==i))
+                type_indices = np.flatnonzero(typevec==i)
+                # Filter type indices to only include those in the specified section
+                if section is not None:
+                    type_indices = np.intersect1d(type_indices, section_indices)
+                ind.append(type_indices)
         else:
-            env_file_path = os.path.join(self.basepath, 'Layer', f"Env_{self.adata_mapping['Type'][:-3]}_{k}.npy")
-            if os.path.exists(env_file_path) and weights is None:
-                print("loading Env from file")
-                return np.load(env_file_path)
-            nbrs_ind,nbrs_dist = self.knn_query((self.XY,self.Section),k=k)
-            typ = self.Type.astype(int)
-            nbrs_types = typ[nbrs_ind.astype(int)]
+            # KNN-based environments
+            env_file_path = None
+            
+            # Set up file path and check for cached results only if caching is enabled
+            if cache_results and weights is None:
+                # Modify file path to include section identifier if working on single section
+                if section is not None:
+                    env_file_path = os.path.join(self.basepath, 'Layer', f"Env_{self.adata_mapping['Type'][:-3]}_{k}_section_{section}.npy")
+                else:
+                    env_file_path = os.path.join(self.basepath, 'Layer', f"Env_{self.adata_mapping['Type'][:-3]}_{k}.npy")
+                    
+                # Try to load from cache if file exists
+                if os.path.exists(env_file_path):
+                    if section is not None:
+                        print(f"loading Env from file for section {section}")
+                    else:
+                        print("loading Env from file")
+                    return np.load(env_file_path)
+                
+            # Prepare data for KNN query
+            if section is not None:
+                # For section-specific queries, we need to query the full dataset
+                # but then filter the results to only include cells from the target section
+                nbrs_ind, nbrs_dist = self.knn_query((self.XY, self.Section), k=k)
+                
+                # Filter to only include results for cells in the target section
+                nbrs_ind_section = nbrs_ind[section_mask, :]
+                nbrs_dist_section = nbrs_dist[section_mask, :]
+                
+                typ = self.Type.astype(int)
+                nbrs_types = typ[nbrs_ind_section.astype(int)]
+                
+                # Update the arrays to reflect the section filtering
+                nbrs_ind = nbrs_ind_section
+                nbrs_dist = nbrs_dist_section
+            else:
+                # Query for all cells
+                nbrs_ind, nbrs_dist = self.knn_query((self.XY, self.Section), k=k)
+                typ = self.Type.astype(int)
+                nbrs_types = typ[nbrs_ind.astype(int)]
             if N is None: 
                 N = self.Type.max()+1
             Env = np.zeros((nbrs_types.shape[0], N), dtype=int)
             # Use np.add.at to accumulate counts directly into the occurrence matrix
             if weights is None: 
                 np.add.at(Env, (np.arange(nbrs_types.shape[0])[:, None], nbrs_types), 1)
-                np.save(env_file_path, Env)
+                # Save to cache only if caching is enabled and file path was set
+                if cache_results and env_file_path is not None:
+                    np.save(env_file_path, Env)
             else:
                 if k<5: 
                     raise ValueError("Weights not implemented for k<5")
-                nbrs_types = typ[nbrs_ind.astype(int)]
                 local_dens = nbrs_dist[:,5][:,None] * weights
                 nbrs_weights = np.exp(-(nbrs_dist**2)/(local_dens**2)) 
                 np.add.at(Env, (np.arange(nbrs_types.shape[0])[:, None], nbrs_types), nbrs_weights)
@@ -1948,13 +2213,15 @@ class TissueGraph:
             return Env
 
         
-        Env = np.zeros((len(ind),len(unqlbl)),dtype=np.int64)
+        # Use N parameter if provided, otherwise use number of unique types in data
+        n_types = N if N is not None else len(unqlbl)
+        Env = np.zeros((len(ind), n_types), dtype=np.int64)
         ndsz = self.node_size.copy().astype(np.int64)
         int_types = self.Type.astype(np.int64)
         AllTypes = [int_types[ix] for ix in ind]
         AllSizes = [ndsz[ix] for ix in ind]
         for i in range(Env.shape[0]):
-            Env[i,:]=np.bincount(AllTypes[i],weights = AllSizes[i],minlength=len(unqlbl))
+            Env[i,:]=np.bincount(AllTypes[i],weights = AllSizes[i],minlength=n_types)
         
         # should be the same as above, but much slower... keeping it here for now till more testing is done. 
         # for i in range(len(ind)):
@@ -2141,6 +2408,62 @@ class TissueGraph:
 
         return freq_matrix, types_used
 
+    @property
+    def SG_knn(self):
+        """Lazy-loading property for spatial KNN objects.
+        
+        If SG_knn doesn't exist but SG does, automatically creates the KNN objects
+        from the existing spatial coordinates. This ensures backward compatibility
+        with TMG objects created before KNN objects were saved by default.
+        
+        Returns
+        -------
+        list or None
+            List of KNN objects (one per section) or None if no spatial graph exists
+        """
+        # If we already have the KNN objects, return them
+        if self._SG_knn is not None:
+            return self._SG_knn
+            
+        # If we don't have KNN objects but we have a spatial graph and XY coordinates,
+        # create the KNN objects lazily
+        if (self.SG is not None and 
+            hasattr(self, 'XY') and self.XY is not None and 
+            hasattr(self, 'Section') and self.Section is not None):
+            
+            self.update_user("Creating missing SG_knn objects on first access...")
+            self._create_spatial_knn_objects()
+            return self._SG_knn
+            
+        # Otherwise return None
+        return None
+    
+    @SG_knn.setter 
+    def SG_knn(self, value):
+        """Setter for SG_knn property."""
+        self._SG_knn = value
+    
+    def _create_spatial_knn_objects(self):
+        """Create KNN objects from existing spatial coordinates.
+        
+        This method creates KNN objects for each section using the same approach
+        as build_spatial_graph but without rebuilding the actual graph.
+        """
+        try:
+            from TMG.Utils import tmgu
+            
+            self._SG_knn = list()
+            for s in self.unqS: 
+                XY_per_section = self.XY[self.Section==s,:]
+                _, knn = tmgu.build_knn_graph(XY_per_section, 'euclidean')
+                self._SG_knn.append(knn)
+            
+            self.update_user(f"✓ Created SG_knn objects for {len(self._SG_knn)} sections")
+            
+        except Exception as e:
+            self.update_user(f"Failed to create SG_knn objects: {e}")
+            self._SG_knn = None
+
 class Taxonomy:
     """Taxonomical system for different biospatial units (cells, isozones, regions)
     
@@ -2300,6 +2623,64 @@ class Taxonomy:
         if any(pos is None for pos in index_positions):
             raise ValueError("One or more specified types are not found in the Type dictionary.")
         return index_positions
+    
+    def add_types(self, type_assignments, feature_matrix):
+        """Add types to taxonomy based on type assignments and feature matrix
+        
+        This method takes individual observations (type assignments vector and feature matrix)
+        and creates unique types with their averaged feature signatures.
+        
+        Parameters
+        ----------
+        type_assignments : array-like
+            Vector of type assignments for each observation (e.g., [0, 1, 0, 2, 1, ...])
+        feature_matrix : array-like
+            Feature matrix where each row corresponds to an observation
+            
+        Notes
+        -----
+        The method will:
+        1. Find unique types in type_assignments
+        2. Calculate average feature signatures for each unique type
+        3. Create type names based on the type indices
+        4. Update the taxonomy with these new types and their features
+        """
+        import pandas as pd
+        
+        # Convert inputs to numpy arrays
+        type_assignments = np.array(type_assignments)
+        feature_matrix = np.array(feature_matrix)
+        
+        # Validate inputs
+        if len(type_assignments) != feature_matrix.shape[0]:
+            raise ValueError(f"Length of type_assignments ({len(type_assignments)}) must match "
+                           f"number of rows in feature_matrix ({feature_matrix.shape[0]})")
+        
+        # Find unique types and calculate their average feature signatures
+        unique_types = np.unique(type_assignments)
+        n_types = len(unique_types)
+        n_features = feature_matrix.shape[1]
+        
+        # Initialize arrays for averaged features and type names
+        averaged_features = np.zeros((n_types, n_features))
+        type_names = []
+        
+        # Calculate average feature signature for each unique type
+        for i, type_id in enumerate(unique_types):
+            mask = type_assignments == type_id
+            averaged_features[i, :] = np.mean(feature_matrix[mask, :], axis=0)
+            type_names.append(f"Type_{type_id}")
+        
+        # Create new anndata object with the averaged features and type names
+        self.adata = anndata.AnnData(X=averaged_features)
+        self.adata.obs["Type"] = type_names
+        
+        # Generate random RGB colors for the new types
+        if hasattr(self, 'coloru'):
+            rgb_hex = coloru.rand_hex_codes(n_types)
+            self.adata.obs['RGB'] = rgb_hex
+        
+        return self
 
 class Geom:
     """
