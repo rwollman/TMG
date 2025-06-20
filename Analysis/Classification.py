@@ -45,6 +45,8 @@ from TMG.Utils import celltypeu
 from functools import partial
 from scipy.ndimage import gaussian_filter
 import pickle
+
+
 class Classifier(metaclass=abc.ABCMeta): 
     """Interface for classifiers 
 
@@ -67,6 +69,22 @@ class Classifier(metaclass=abc.ABCMeta):
         if tax is None: 
             tax = TissueGraph.Taxonomy(name='clusters')
         self.tax = tax
+    
+    def update_user(self, message, verbose=True):
+        """Update user with a message
+        
+        Parameters
+        ----------
+        message : str
+            Message to display to the user
+        verbose : bool, default True
+            Whether to print the message. Can be overridden by subclasses
+            to implement more sophisticated logging.
+        """
+        
+        logging.info(message)
+        if verbose:
+            print(f"{message} - {datetime.now().strftime('%Y %m %d %H %M %S')}")
     
     @abc.abstractmethod
     def train(self):
@@ -337,12 +355,17 @@ class TopicClassifier(Classifier):
 
     Decision on number of topics comes from maximizing overall entropy. 
     """
-    def __init__(self,TG, ordr=4):
+    def __init__(self, TG, ordr=4, taxonomy=None):
         """
         Parameters
         ----------
         TG : TissueGraph
             Required parameter - the TissueGraph object we're going to use for unsupervised clustering. 
+        ordr : int, default 4
+            Order of neighborhood for extracting environments
+        taxonomy : Taxonomy, optional
+            Taxonomy object that defines the number of types. If provided, will be used
+            to determine the correct number of columns for the environment matrix.
         """
         if not isinstance(TG, TissueGraph.TissueGraph): 
             raise ValueError("TopicClassifier requires a (cell level) TissueGraph object as input")
@@ -350,7 +373,13 @@ class TopicClassifier(Classifier):
         super().__init__(tax = None)
         self.tax.name = 'topics'
         self._TG = TG
-        Env = self._TG.extract_environments(ordr=ordr)
+        
+        # Extract environments using the taxonomy if provided
+        if taxonomy is not None:
+            Env = self._TG.extract_environments(ordr=ordr, N=taxonomy.N)
+        else:
+            Env = self._TG.extract_environments(ordr=ordr)
+            
         row_sums = Env.sum(axis=1)
         row_sums = row_sums[:,None]
         Env = Env/row_sums
