@@ -628,13 +628,26 @@ class TissueMultiGraph:
         self.update_user('done with create_cell_layer')
         return
 
-    def create_merged_layer(self, base_layer_id = 0, replace = False, layer_type = None, tax_name = None, tax_composition_name = None, Labels=None):
+    def create_merged_layer(self, base_layer_id = 0, replace = False, layer_type = None, tax_name = None, composition_taxonomy = None, Labels=None):
         """
         Creates an merged_layer from existing layer. The merged layer could be an "iso" layer
         using existing Type and ensuring merges of only connected components 
         Or, it could be any labeling of original graph, if Labels are provided
 
-        replace = True (default false) allow overwriting existing layer
+        Parameters
+        ----------
+        base_layer_id : int, default 0
+            Layer ID to create merged layer from
+        replace : bool, default False
+            Allow overwriting existing layer
+        layer_type : str
+            Name (layer_type) of the new layer
+        tax_name : str, optional
+            Name of taxonomy to use for base layer
+        composition_taxonomy : Taxonomy, optional
+            Taxonomy object for composition-based merging with upstream relationships
+        Labels : array-like, optional
+            Custom labels for merging
 
         """
         if layer_type is None: 
@@ -650,29 +663,45 @@ class TissueMultiGraph:
         if tax_name is not None: 
             self.update_current_type(base_layer_id,tax_name)
 
-        # Contract graph. 
-        MergedLayer = self.Layers[base_layer_id].contract_graph(Labels=Labels)
-
-        # if this is a composition based merge, first determine the size of feature_mat
-        if tax_composition_name is not None:
-            all_tax_names = [tx.name for tx in self.Taxonomies]
-            composition_tax_id = all_tax_names.index(tax_composition_name)
+        # Contract graph with appropriate feature calculation
+        if composition_taxonomy is not None:
+            # For composition layers, we'll set the feature matrix manually after contracting
+            MergedLayer = self.Layers[base_layer_id].contract_graph(Labels=Labels, feature_mat_calc=None)
             
+            # Set the feature matrix to be the composition-based environments
+            composition_features = self.Layers[base_layer_id].extract_environments(typevec=Labels,N=len(composition_taxonomy.upstream_type))
+            MergedLayer.feature_mat = composition_features
+        else:
+            # For regular layers, use default mean calculation
+            MergedLayer = self.Layers[base_layer_id].contract_graph(Labels=Labels)
+
         MergedLayer.layer_type = layer_type
         if merged_layer_id is None: 
             self.Layers.append(MergedLayer)
             merged_layer_id = len(self.Layers)-1  
         else: 
             self.Layers[merged_layer_id] = MergedLayer
-        self.layer_taxonomy_mapping[merged_layer_id] = self.layer_taxonomy_mapping[base_layer_id]
+        
+        # Handle composition taxonomy if provided
+        if composition_taxonomy is not None:
+            # Add the composition taxonomy to TMG if not already present
+            if composition_taxonomy.name not in self.tax_names:
+                self.Taxonomies.append(composition_taxonomy)
+                comp_tax_id = len(self.Taxonomies) - 1
+            else:
+                comp_tax_id = self.tax_names.index(composition_taxonomy.name)
+            
+            # Set the merged layer to use the composition taxonomy
+            self.layer_taxonomy_mapping[merged_layer_id] = comp_tax_id
+         
+
+        else:
+            # Default behavior: copy taxonomy mapping from base layer
+            self.layer_taxonomy_mapping[merged_layer_id] = self.layer_taxonomy_mapping[base_layer_id]
+        
+        # Update layers graph
         self.layers_graph.append((base_layer_id,merged_layer_id))
 
-        if tax_composition_name is not None:
-            self.update_current_type(base_layer_id,tax_composition_name)
-            Env = self.Layers[base_layer_id].extract_environments(typevec=self.Layers[merged_layer_id].Upstream)
-            self.Layers[merged_layer_id].feature_mat = Env
-    
-    
     def find_upstream_layer(self, layer_id):
         """
         Use the layer graph to find the layer_id's upstream layer
@@ -2104,7 +2133,7 @@ class TissueGraph:
         k : int, optional
             Number of nearest neighbors for spatial KNN environments
         N : int, optional
-            Number of types (for k-based method)
+            Number of types 
         weights : array-like, optional
             Weights for distance-based calculations (for k-based method)
         section : str or int, optional
@@ -2579,8 +2608,8 @@ class Taxonomy:
 
     @property
     def upstream_type(self): 
-        if "upstream_type" in self.adata.obs:
-            return self.adata.obs["upstream_type"]
+        if "upstream_type" in self.adata.uns:
+            return self.adata.uns["upstream_type"]
         else: 
             return None
         
@@ -2588,8 +2617,7 @@ class Taxonomy:
     def upstream_type(self,upstream_type):
         if "upstream_tax" not in self.adata.uns:
             raise ValueError("Set upstream_tax before adding a type")
-        
-        self.adata.obs["upstream_type"] = upstream_type
+        self.adata.uns["upstream_type"] = upstream_type
 
     @property
     def N(self):

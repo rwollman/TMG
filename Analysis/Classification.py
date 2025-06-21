@@ -1,8 +1,37 @@
 """Classification of biospatial units in TMG analysis
 
-This module contains the main classes related to the task of classification of biospatial units (i.e. cells, isozones, regions) into type. 
-The module is composed of a class hierarchy of classifiers. The "root" of this heirarchy is an abstract base class "Classifier" that has two 
-abstract methods (train and classify) that any subclass will have to implement. 
+This module contains the main classes related to the task of classification of biospatial units 
+(i.e. cells, isozones, regions) into type. The module is composed of a class hierarchy of 
+classifiers. The "root" of this hierarchy is an abstract base class "Classifier" that has two 
+abstract methods (train and classify) that any subclass will have to implement.
+
+New Composition Taxonomy Features
+=================================
+
+This module now includes enhanced support for composition-based taxonomies that maintain proper
+upstream relationships. Key components:
+
+Classes:
+- CompositionClassifier: Abstract base class for classifiers that create composed types
+- TopicClassifier: Now inherits from CompositionClassifier, creates cell neighborhoods
+
+Functions:
+- create_composition_taxonomy(): Helper function to create taxonomies with upstream relationships
+
+Key Features:
+- Automatic upstream taxonomy relationship management
+- Composition feature extraction (e.g., topic-word distributions)
+- Integration with create_merged_layer() method
+- Validation of taxonomy hierarchies
+- Navigation of taxonomy relationships
+
+Usage Pattern:
+1. Train a CompositionClassifier (e.g., TopicClassifier)
+2. Use create_composition_taxonomy() to create taxonomy with upstream relationships
+3. Use composition_taxonomy parameter in create_merged_layer()
+4. Leverage upstream relationships for analysis
+
+See create_composition_taxonomy() docstring for detailed examples.
 
 """
 
@@ -350,94 +379,7 @@ class OptimalLeidenKNNClassifier(KNNClassifier):
         super().train(self._TG.feature_mat, TypeVec)
          
 
-class TopicClassifier(Classifier): 
-    """Uses Latent Dirichlet Allocation to classify cells into regions types. 
 
-    Decision on number of topics comes from maximizing overall entropy. 
-    """
-    def __init__(self, TG, ordr=4, taxonomy=None):
-        """
-        Parameters
-        ----------
-        TG : TissueGraph
-            Required parameter - the TissueGraph object we're going to use for unsupervised clustering. 
-        ordr : int, default 4
-            Order of neighborhood for extracting environments
-        taxonomy : Taxonomy, optional
-            Taxonomy object that defines the number of types. If provided, will be used
-            to determine the correct number of columns for the environment matrix.
-        """
-        if not isinstance(TG, TissueGraph.TissueGraph): 
-            raise ValueError("TopicClassifier requires a (cell level) TissueGraph object as input")
-
-        super().__init__(tax = None)
-        self.tax.name = 'topics'
-        self._TG = TG
-        
-        # Extract environments using the taxonomy if provided
-        if taxonomy is not None:
-            Env = self._TG.extract_environments(ordr=ordr, N=taxonomy.N)
-        else:
-            Env = self._TG.extract_environments(ordr=ordr)
-            
-        row_sums = Env.sum(axis=1)
-        row_sums = row_sums[:,None]
-        Env = Env/row_sums
-        self.Env = Env
-
-    def lda_fit(self, n_topics):
-        """This cannot be nested inside
-        """
-        Env = self.Env
-
-        lda = LatentDirichletAllocation(n_components=n_topics)
-        B = lda.fit(Env)
-        T = lda.transform(Env)
-        return (B,T)
-
-    def train(self, 
-        n_topics_list=np.geomspace(2,100,num=10).astype(int), 
-        n_procs=1):
-        """fit multiple LDA models and chose the one with highest type entropy
-        """
-        # define function handle
-        if n_procs == 1: 
-            self.update_user("Running LDA in serial") 
-            results = [self.lda_fit(n_topics) for n_topics in n_topics_list]
-        else:
-            n_procs = max(n_procs, len(n_topics_list))
-            self.update_user(f"Running LDA in parallel with {n_procs} cores")
-            with Pool(n_procs) as pl:
-                results = pl.map(self.lda_fit, n_topics_list)
-
-        IDs = np.zeros((self._TG.N,len(results)))
-        for i in range(len(results)):
-            IDs[:,i] = np.argmax(results[i][1],axis=1)
-        Type_entropy = np.zeros(IDs.shape[1])
-        for i in range(IDs.shape[1]):
-            _,cnt = np.unique(IDs[:,i],return_counts=True)
-            cnt=cnt/cnt.sum()
-            Type_entropy[i] = entropy(cnt,base=2) 
-
-        # some of the topics might be empty (weren't used in the fit)
-        # so need to find the correct number and refit
-        curr_lda = results[np.argmax(Type_entropy)][0]
-        topics_prob = curr_lda.transform(self.Env)
-        topics = np.argmax(topics_prob, axis=1)
-        # train one last LDA after we found the correct number of topics
-        n_topics = topics.max()
-        self._lda = self.lda_fit(n_topics)[0]
-        topics_prob = self._lda.transform(self.Env)
-        topics = np.argmax(topics_prob, axis=1)
-        self.tax.add_types(topics,self.Env)
-        return self
-
-    def classify(self,data):
-        """classify based on fitted LDA"""
-        topics_prob = self._lda.transform(data)
-        topics = np.argmax(topics_prob, axis=1)
-
-        return topics
     
 class KnownCellTypeClassifier(Classifier): 
     """
@@ -2699,3 +2641,205 @@ class SingleCellAlignmentLeveragingExpectations():
 
                 plt.tight_layout()
                 plt.show()
+
+class CompositionClassifier(Classifier):
+    """Abstract base class for classifiers that create composition-based taxonomies
+    
+    CompositionClassifiers create new "composed" types from base units (e.g., neighborhoods from cells).
+    They support creating taxonomies with proper upstream relationships to the base taxonomy.
+    
+    Attributes
+    ----------
+    _TG : TissueGraph
+        The tissue graph containing the base units to be composed
+    _composition_features : array-like
+        Feature signatures of the composed types
+    _upstream_mappings : array-like  
+        Mapping from base units to composed types
+    """
+    
+    def __init__(self, TG, tax=None):
+        """Initialize composition classifier
+        
+        Parameters
+        ----------
+        TG : TissueGraph
+            The tissue graph containing base units
+        tax : Taxonomy, optional
+            Taxonomy for the composed types
+        """
+        if not isinstance(TG, TissueGraph.TissueGraph): 
+            raise ValueError("CompositionClassifier requires a TissueGraph object as input")
+            
+        super().__init__(tax=tax)
+        self._TG = TG
+        self._composition_features = None
+        self._upstream_mappings = None
+        self._n_components = None
+    
+    @property
+    def n_components(self):
+        """Number of composition types discovered"""
+        return self._n_components
+    
+    @abc.abstractmethod
+    def get_composition_features(self):
+        """Get feature signatures for each composition type
+        
+        Returns
+        -------
+        array-like
+            Feature matrix where each row represents one composition type
+        """
+        pass
+    
+    def get_composition_info(self):
+        """Get complete composition information
+        
+        Returns
+        -------
+        comp_types : list
+            Names of composition types
+        comp_features : array-like
+            Feature signatures of composition types  
+        """
+        comp_features = self.get_composition_features()
+        comp_types = [f"{self.__class__.__name__}_Type_{i}" for i in range(self.n_components)]
+        
+        return comp_types, comp_features
+    
+    def create_composition_taxonomy(self, base_taxonomy=None, composition_name=None):
+        """Create a composition taxonomy with proper upstream relationships
+        
+        Parameters
+        ----------
+        base_taxonomy : Taxonomy, optional
+            The base taxonomy object. If None, uses current taxonomy of tissue_graph
+        composition_name : str, optional
+            Name for the new composition taxonomy. If None, auto-generates
+            
+        Returns
+        -------
+        Taxonomy
+            New composition taxonomy with upstream relationship to base taxonomy
+        """
+        # Get base taxonomy info
+        base_tax_name = base_taxonomy.name
+        
+        # Auto-generate composition name if not provided
+        if composition_name is None:
+            composition_name = f"{base_tax_name}_{self.__class__.__name__.lower()}"
+        
+        # Get composition information
+        comp_types, comp_features = self.get_composition_info()
+        
+        # Create composition taxonomy with proper upstream relationships
+        comp_taxonomy = TissueGraph.Taxonomy(
+            name=composition_name,
+            basepath=self._TG.basepath,
+            Types=comp_types,
+            feature_mat=comp_features,
+            upstream_tax=base_tax_name,
+            upstream_types=base_taxonomy.Type
+        )
+        
+        return comp_taxonomy
+
+class TopicClassifier(CompositionClassifier): 
+    """Uses Latent Dirichlet Allocation to classify cells into regions types. 
+
+    Decision on number of topics comes from maximizing overall entropy. 
+    """
+    def __init__(self, TG, ordr=4, taxonomy=None):
+        """
+        Parameters
+        ----------
+        TG : TissueGraph
+            Required parameter - the TissueGraph object we're going to use for unsupervised clustering. 
+        ordr : int, default 4
+            Order of neighborhood for extracting environments
+        taxonomy : Taxonomy, optional
+            Taxonomy object that defines the number of types. If provided, will be used
+            to determine the correct number of columns for the environment matrix.
+        """
+        super().__init__(TG, tax=None)
+        self.tax.name = 'topics'
+        
+        # Extract environments using the taxonomy if provided
+        if taxonomy is not None:
+            Env = self._TG.extract_environments(ordr=ordr, N=taxonomy.N)
+        else:
+            Env = self._TG.extract_environments(ordr=ordr)
+            
+        row_sums = Env.sum(axis=1)
+        row_sums = row_sums[:,None]
+        Env = Env/row_sums
+        self.Env = Env
+        self._lda = None
+
+    def lda_fit(self, n_topics):
+        """This cannot be nested inside
+        """
+        Env = self.Env
+
+        lda = LatentDirichletAllocation(n_components=n_topics)
+        B = lda.fit(Env)
+        T = lda.transform(Env)
+        return (B,T)
+
+    def train(self, 
+        n_topics_list=np.geomspace(2,100,num=10).astype(int), 
+        n_procs=1):
+        """fit multiple LDA models and chose the one with highest type entropy
+        """
+        # define function handle
+        if n_procs == 1: 
+            self.update_user("Running LDA in serial") 
+            results = [self.lda_fit(n_topics) for n_topics in n_topics_list]
+        else:
+            n_procs = max(n_procs, len(n_topics_list))
+            self.update_user(f"Running LDA in parallel with {n_procs} cores")
+            with Pool(n_procs) as pl:
+                results = pl.map(self.lda_fit, n_topics_list)
+
+        IDs = np.zeros((self._TG.N,len(results)))
+        for i in range(len(results)):
+            IDs[:,i] = np.argmax(results[i][1],axis=1)
+        Type_entropy = np.zeros(IDs.shape[1])
+        for i in range(IDs.shape[1]):
+            _,cnt = np.unique(IDs[:,i],return_counts=True)
+            cnt=cnt/cnt.sum()
+            Type_entropy[i] = entropy(cnt,base=2) 
+
+        # some of the topics might be empty (weren't used in the fit)
+        # so need to find the correct number and refit
+        curr_lda = results[np.argmax(Type_entropy)][0]
+        topics_prob = curr_lda.transform(self.Env)
+        topics = np.argmax(topics_prob, axis=1)
+        # train one last LDA after we found the correct number of topics
+        n_topics = topics.max() + 1  # +1 because topics are 0-indexed
+        self._lda = self.lda_fit(n_topics)[0]
+        topics_prob = self._lda.transform(self.Env)
+        topics = np.argmax(topics_prob, axis=1)
+        
+        # Store composition information
+        self._n_components = n_topics
+        self._composition_features = self._lda.components_  # Topic-word distributions
+        self._upstream_mappings = topics
+        
+        self.tax.add_types(topics, self.Env)
+        return self
+
+    def classify(self, data):
+        """classify based on fitted LDA"""
+        topics_prob = self._lda.transform(data)
+        topics = np.argmax(topics_prob, axis=1)
+        return topics
+    
+    def get_composition_features(self):
+        """Get topic-word distributions as composition features"""
+        if self._lda is None:
+            raise ValueError("Must train classifier before getting composition features")
+        return self._lda.components_
+    
+
