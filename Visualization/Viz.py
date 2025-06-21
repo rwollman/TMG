@@ -269,20 +269,13 @@ class SingleMapView(View):
             try:
                 # Get XY coordinates for the specified section
                 xy_data = TMG.Layers[0].get_XY(section=section)
-                if xy_data is not None and len(xy_data) > 0:
-                    # Calculate bounds with small margin
-                    x_min, x_max = xy_data[:, 0].min(), xy_data[:, 0].max()
-                    y_min, y_max = xy_data[:, 1].min(), xy_data[:, 1].max()
-                    
-                    # Add 5% margin on each side
-                    x_margin = (x_max - x_min) * 0.05
-                    y_margin = (y_max - y_min) * 0.05
-                    
+                xlim_calc, ylim_calc = geomu.calculate_xy_limits(xy_data)
+                if xlim_calc is not None and ylim_calc is not None:
                     # Update the view limits if not provided in kwargs
                     if 'xlim' not in kwargs:
-                        self.lims['x'] = np.array([x_min - x_margin, x_max + x_margin])
+                        self.lims['x'] = xlim_calc
                     if 'ylim' not in kwargs:
-                        self.lims['y'] = np.array([y_min - y_margin, y_max + y_margin])
+                        self.lims['y'] = ylim_calc
             except Exception as e:
                 # If auto-calculation fails, keep default limits and warn
                 print(f"Warning: Could not auto-calculate limits from XY data: {e}")
@@ -305,6 +298,62 @@ class SingleMapView(View):
             Pmap = TypeWithBoundaries(V=self, section=section, poly_geom=poly_geom, boundaries_geom=bound_geom,**kwargs)
         else: 
             raise ValueError(f"value {map_type} is not a recognized map_type")
+
+class CellAndNeighborhoodView(View):
+    """
+    A view that displays two type maps side by side:
+    - Left panel: cell layer type map
+    - Right panel: cell_neighborhoods layer type map
+    """
+    def __init__(self, TMG, section=None, figsize=(22, 11), **kwargs):
+        """
+        Create a dual type map view with cell and cell_neighborhoods layers.
+
+        Parameters
+        ----------
+        TMG : TissueMultiGraph
+            The TissueMultiGraph object containing the data.
+        section : str, optional
+            The section to display. If None, uses the first section in TMG.
+        figsize : tuple, default (22, 11)
+            The size of the overall figure (width, height).
+        **kwargs : dict
+            Additional keyword arguments passed to the TypeMap panels.
+        """
+        super().__init__(TMG, "Cell and Neighborhood Type Maps", figsize)
+        
+        # Set default section to be the first in unqS if not specified
+        if section is None and len(TMG.unqS) > 0:
+            section = TMG.unqS[0]
+        
+        # Calculate view limits based on cell layer XY data
+        # Auto-calculate view limits if not provided in kwargs
+        if 'xlim' not in kwargs or 'ylim' not in kwargs:
+            try:
+                xy_data = TMG.Layers[0].get_XY(section=section)
+                xlim_calc, ylim_calc = geomu.calculate_xy_limits(xy_data)
+                if xlim_calc is not None and ylim_calc is not None:
+                    if 'xlim' not in kwargs:
+                        self.lims['x'] = xlim_calc
+                    if 'ylim' not in kwargs:
+                        self.lims['y'] = ylim_calc
+            except Exception as e:
+                print(f"Warning: Could not auto-calculate limits from XY data: {e}")
+                print("Using default hardcoded limits.")
+        
+        # Create grid spec for two panels side by side
+        gs = self.fig.add_gridspec(1, 2, wspace=0.02)
+        
+        # Create left panel for cell layer
+        cell_geom_type = TMG.layer_to_geom_type_mapping["cell"]
+        TypeMap(cell_geom_type, V=self, section=section, 
+                name="Cell Layer", pos=gs[0], **kwargs)
+        
+        # Create right panel for cell_neighborhoods layer  
+        neighborhoods_geom_type = TMG.layer_to_geom_type_mapping["cell_neighborhoods"]
+        TypeMap(neighborhoods_geom_type, V=self, section=section,
+                name="Cell Neighborhoods Layer", pos=gs[1], **kwargs)
+
 
 class MultiSectionScatterView(View):
     """
@@ -413,7 +462,7 @@ class MultiSectionScatterView(View):
             col = i % self.n_columns
             
             # Create scatter panel for this section
-            panel = MultiSectionScatterPanel(
+            panel = MultiSectionScatter(
                 V=self, section=section, layer=self.layer, bit=bit,
                 cmap=cmap, global_contrast=global_contrast, quantile=quantile,
                 vmin=vmin, vmax=vmax, sort_order=sort_order, s=s,
