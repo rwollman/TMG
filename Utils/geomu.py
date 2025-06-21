@@ -965,4 +965,36 @@ def calc_mask_voronoi_polygons_from_XY(XY,units='mm'):
     
     return section_geom_polys
 
+def calculate_xy_limits(XY, margin_fraction=0.05):
+    """
+    Calculate xlim and ylim from XY coordinates with optional margin.
+    
+    Parameters
+    ----------
+    XY : numpy.ndarray
+        Array of XY coordinates with shape (n_points, 2)
+    margin_fraction : float, default 0.05
+        Fraction of the range to add as margin on each side
+        
+    Returns
+    -------
+    tuple
+        (xlim, ylim) where each is a numpy array [min, max]
+    """
+    if XY is None or len(XY) == 0:
+        return None, None
+        
+    # Calculate bounds
+    x_min, x_max = XY[:, 0].min(), XY[:, 0].max()
+    y_min, y_max = XY[:, 1].min(), XY[:, 1].max()
+    
+    # Add margin
+    x_margin = (x_max - x_min) * margin_fraction
+    y_margin = (y_max - y_min) * margin_fraction
+    
+    xlim = np.array([x_min - x_margin, x_max + x_margin])
+    ylim = np.array([y_min - y_margin, y_max + y_margin])
+    
+    return xlim, ylim
+
 
