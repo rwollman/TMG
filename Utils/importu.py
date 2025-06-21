@@ -107,7 +107,8 @@ def load_xenium_data(xenium_path: str,
     adata.obs['section_name'] = section_name
     adata.obs['Slice'] = section_name
     
-    # Add spatial coordinates
+    # Add spatial coordinates with Z=0
+    adata.obs['ccf_x'] = 0.0  # Add Z coordinate as 0 for all cells (using TissueGraph's default Z mapping)
     adata.obsm['XY'] = np.array(adata.obs[['x_centroid', 'y_centroid']])
     
     # Create TissueGraph from adata
