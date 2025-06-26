@@ -54,5 +54,4 @@ dependencies:
   # pip-only packages (not available in conda)
   - pip
   - pip:
-    - colormath
     - xycmap  # Usually better via pip for latest version 
