@@ -61,7 +61,7 @@ conda activate TMG
 - **Graph Analysis**: python-igraph, leidenalg, pynndescent for graph operations
 - **Single-cell**: AnnData for single-cell data handling
 - **Image Processing**: Pillow, OpenCV, scikit-image for image analysis
-- **Specialized**: colormath for color space operations, umap-learn for dimensionality reduction
+- **Specialized**: native color space operations, umap-learn for dimensionality reduction
 
 ## Quick Start
 
