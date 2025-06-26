@@ -25,7 +25,6 @@ TODO:
 1. Finish with legends and pie/wedge legens. 
 2. clean dependencies
 3. move UMAP color to coloru
-4. move ploting from geomu to powerplots (?)
 """
 
 from matplotlib.gridspec import GridSpec, SubplotSpec
@@ -522,6 +521,81 @@ class UMAPwithSpatialMapView(View):
         self.legend_ax.set_yticks([])
 
 
+class CompositionMapWithLegendView(View):
+    """
+    A view that displays a TypeMap of a composition layer alongside its CompositionLegend.
+    Shows the spatial distribution of composition types with their compositional breakdown.
+    """
+    def __init__(self, TMG, composition_layer_name, section=None, figsize=(24, 11), **kwargs):
+        """
+        Create a composition map with legend view.
+
+        Parameters
+        ----------
+        TMG : TissueMultiGraph
+            The TissueMultiGraph object containing the data.
+        composition_layer_name : str
+            Name of the composition layer to visualize (e.g., 'cell_neighborhoods').
+        section : str, optional
+            The section to display. If None, uses the first section in TMG.
+        figsize : tuple, default (18, 11)
+            The size of the overall figure (width, height).
+        **kwargs : dict
+            Additional keyword arguments passed to the TypeMap panel.
+        """
+        super().__init__(TMG, f"Composition Map: {composition_layer_name}", figsize)
+        
+        # Set default section to be the first in unqS if not specified
+        if section is None and len(TMG.unqS) > 0:
+            section = TMG.unqS[0]
+        
+        # Get the composition layer and validate it exists
+        try:
+            composition_layer = TMG.get_layer(composition_layer_name)
+        except:
+            raise ValueError(f"Composition layer '{composition_layer_name}' not found in TMG")
+        
+        # Get the taxonomy for this layer
+        layer_idx = TMG.find_layer_by_name(composition_layer_name)
+        if layer_idx not in TMG.layer_taxonomy_mapping:
+            raise ValueError(f"No taxonomy found for layer '{composition_layer_name}'")
+        
+        taxonomy_idx = TMG.layer_taxonomy_mapping[layer_idx]
+        composition_taxonomy = TMG.Taxonomies[taxonomy_idx]
+        
+        # Calculate view limits based on cell layer XY data (assuming cells are in layer 0)
+        if 'xlim' not in kwargs or 'ylim' not in kwargs:
+            try:
+                xy_data = TMG.Layers[0].get_XY(section=section)
+                xlim_calc, ylim_calc = geomu.calculate_xy_limits(xy_data)
+                if xlim_calc is not None and ylim_calc is not None:
+                    if 'xlim' not in kwargs:
+                        self.lims['x'] = xlim_calc
+                    if 'ylim' not in kwargs:
+                        self.lims['y'] = ylim_calc
+            except Exception as e:
+                print(f"Warning: Could not auto-calculate limits from XY data: {e}")
+                print("Using default hardcoded limits.")
+        
+        # Create grid spec: map takes 70% width, legend takes 30% for bigger pie charts
+        gs = self.fig.add_gridspec(1, 2, wspace=0.02, width_ratios=[0.7, 0.3])
+        
+        # Create TypeMap panel for the composition layer
+        geom_type = TMG.layer_to_geom_type_mapping[composition_layer_name]
+        type_map = TypeMap(geom_type, V=self, section=section, 
+                          name=f"{composition_layer_name} Map", pos=gs[0], **kwargs)
+        
+        # Create CompositionLegend panel
+        legend_kwargs = {k: v for k, v in kwargs.items() 
+                        if k in ['min_wedge_threshold', 'pie_size', 'spacing']}
+        composition_legend = CompositionLegend(V=self, composition_taxonomy=composition_taxonomy,
+                                             name=f"{composition_layer_name} Legend", pos=gs[1],
+                                             **legend_kwargs)
+        
+        # Debug: Print basic panel information
+        print(f"✓ Created {len(self.Panels)} panels: TypeMap + CompositionLegend")
+
+
 class DapiValueDistributionsView(View):
     def __init__(self,TMG,figsize = (16,8),min_dapi_line = None,max_dapi_line = None):
         super().__init__(TMG,name = "Dapi per section violin",figsize = figsize)
@@ -941,7 +1015,7 @@ class Colorpleth(Map):
  
                  
     
-""" class LegendWithCircles(Panel): 
+"""class LegendWithCircles(Panel): 
     def __init__(self, map_panel, name=None, pos=(0,0,1,1), scale=300, **kwargs):
         super().__init__(name=name, pos=pos, **kwargs)
         self.map_panel = map_panel
@@ -1629,5 +1703,139 @@ class CellCellInteractions(PolarPanel):
         # Hide polar axes elements
         self.ax.set_rticks([])
         self.ax.set_thetagrids([])
+
+class CompositionLegend(Panel):
+    """
+    Creates a vertical arrangement of pie charts showing composition data.
+    Each pie chart represents one composition type, with wedges colored by upstream taxonomy colors
+    and wedge sizes proportional to the composition feature matrix values.
+    """
+    def __init__(self, V=None, composition_taxonomy=None, name="Composition Legend", 
+                 pos=(0,0,1,1), min_wedge_threshold=0.01, 
+                 pie_size=0.8, spacing=0.1, **kwargs):
+        super().__init__(V, name, pos)
+        
+        if composition_taxonomy is None:
+            raise ValueError("composition_taxonomy is required")
+        
+        if composition_taxonomy.upstream_tax is None:
+            raise ValueError("Composition taxonomy must have an upstream taxonomy")
+        
+        self.composition_taxonomy = composition_taxonomy
+        
+        # Get the upstream taxonomy object by name from TMG
+        upstream_tax_name = composition_taxonomy.upstream_tax
+        self.upstream_taxonomy = self.V.TMG.get_tax(upstream_tax_name)
+        
+        if self.upstream_taxonomy is None:
+            raise ValueError(f"Upstream taxonomy '{upstream_tax_name}' not found in TMG")
+        
+        # Validate that we have the required data
+        if composition_taxonomy.feature_mat is None:
+            raise ValueError("Composition taxonomy must have a feature matrix")
+        
+        if self.upstream_taxonomy.RGB is None:
+            raise ValueError("Upstream taxonomy must have RGB colors")
+        
+        # Store parameters
+        self.min_wedge_threshold = min_wedge_threshold
+        self.pie_size = pie_size
+        self.spacing = spacing
+        
+        # Extract data
+        self.composition_types = composition_taxonomy.Type
+        self.composition_colors = composition_taxonomy.RGB / 255.0 if composition_taxonomy.RGB.max() > 1 else composition_taxonomy.RGB
+        self.feature_mat = composition_taxonomy.feature_mat
+        self.upstream_colors = self.upstream_taxonomy.RGB / 255.0 if self.upstream_taxonomy.RGB.max() > 1 else self.upstream_taxonomy.RGB
+        self.upstream_types = self.upstream_taxonomy.Type
+        
+        # Validate dimensions
+        if self.feature_mat.shape[1] != len(self.upstream_types):
+            raise ValueError(f"Feature matrix columns ({self.feature_mat.shape[1]}) must match "
+                           f"number of upstream types ({len(self.upstream_types)})")
+        
+        if len(self.composition_types) != self.feature_mat.shape[0]:
+            raise ValueError(f"Number of composition types ({len(self.composition_types)}) must match "
+                           f"feature matrix rows ({self.feature_mat.shape[0]})")
+    
+    def plot(self):
+        """Create and plot the pie charts for each composition type."""
+        print(f"🎯 Creating composition legend with {len(self.composition_types)} types")
+        n_compositions = len(self.composition_types)
+        
+        if n_compositions == 0:
+            raise ValueError("No composition types to plot")
+        
+        # Calculate layout - use full vertical space with minimal spacing
+        # Reduce spacing even further and increase chart size
+        effective_spacing = 0.01  # Very minimal spacing between charts
+        chart_height = (1.0 - (n_compositions - 1) * effective_spacing) / n_compositions
+        
+        for i, comp_type in enumerate(self.composition_types):
+            # Calculate position for this pie chart
+            y_pos = 1.0 - (i + 1) * chart_height - i * effective_spacing
+            chart_center_x = 0.25  # Move charts slightly more to the left for larger pies
+            chart_center_y = y_pos + chart_height / 2
+            
+            # Get composition values for this type
+            comp_values = self.feature_mat[i, :]
+            
+            # Filter out very small values
+            significant_mask = comp_values >= self.min_wedge_threshold
+            if not significant_mask.any():
+                # If no significant values, take the largest one
+                significant_mask[np.argmax(comp_values)] = True
+            
+            filtered_values = comp_values[significant_mask]
+            filtered_colors = self.upstream_colors[significant_mask]
+            filtered_upstream_types = self.upstream_types[significant_mask]
+            print(f"     Filtered to {len(filtered_values)} values above threshold {self.min_wedge_threshold}")
+            
+            # Normalize values for pie chart (should sum to 1)
+            total_value = filtered_values.sum()
+            if total_value <= 0:
+                raise ValueError(f"Composition type '{comp_type}' has no positive values")
+            
+            normalized_values = filtered_values / total_value
+            print(f"     Normalized values: {normalized_values}")
+            
+            # Create larger pie charts - use more of the available space
+            radius = min(chart_height * 0.45, 0.08) * self.pie_size  # Larger radius with maximum cap
+            print(f"     Radius: {radius}")
+            
+            try:
+                wedges, texts = self.ax.pie(
+                    normalized_values,
+                    colors=filtered_colors,
+                    center=(chart_center_x, chart_center_y),
+                    radius=radius,
+                    startangle=90,
+                    textprops={'fontsize': 8}
+                )
+                print(f"     ✓ Successfully created pie chart with {len(wedges)} wedges")
+                
+                # Add composition type label with matching color from composition taxonomy
+                label_x = chart_center_x + radius + 0.03  # Position to the right of pie chart
+                label_y = chart_center_y
+                self.ax.text(
+                    label_x, label_y,
+                    comp_type,
+                    ha='left', va='center',
+                    color=self.composition_colors[i],
+                    fontsize=10,
+                    fontweight='bold'
+                )
+                print(f"     ✓ Added label '{comp_type}' at ({label_x:.3f}, {label_y:.3f})")
+                
+            except Exception as e:
+                print(f"     ❌ Error creating pie chart: {e}")
+                raise
+        
+        # Set axis properties
+        self.ax.set_xlim(0, 1)
+        self.ax.set_ylim(0, 1)
+        self.ax.set_aspect('equal')
+        self.ax.axis('off')
+        print(f"✓ Created {n_compositions} pie charts with colored labels")
 
 
