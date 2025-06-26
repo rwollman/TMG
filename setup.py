@@ -39,7 +39,7 @@ setup(
         "tqdm", 
         "colorcet",
         "xycmap",
-        "colormath",
+    
 
     ],
     extras_require={
