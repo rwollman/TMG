@@ -397,11 +397,19 @@ def _merge_and_filter_data_xenium(adata: anndata.AnnData,
 
 def _create_cell_taxonomy_xenium(tmg: TissueMultiGraph, clustering_data: pd.DataFrame, adata: anndata.AnnData):
     """Create and add cell type taxonomy to TMG from Xineum clustering results."""
+    print("Computing taxonomy feature matrix from gene expression profiles...")
+    
     if clustering_data.empty:
         # Create simple taxonomy with single Unknown type
         types = ['Unknown']
+        # Use mean expression across all cells as the Unknown type profile
+        if scipy.sparse.issparse(adata.X):
+            feature_mat = adata.X.mean(axis=0).A1.reshape(1, -1)  # Convert to dense and reshape
+        else:
+            feature_mat = adata.X.mean(axis=0).reshape(1, -1)
+        
         taxonomy = Taxonomy(name='xenium_types', basepath=tmg.basepath,
-                           Types=types, feature_mat=np.ones((1, 1)))
+                           Types=types, feature_mat=feature_mat)
     else:
         # Create taxonomy from clustering results
         # Get unique clusters and sort them to ensure consistent indexing
@@ -417,12 +425,43 @@ def _create_cell_taxonomy_xenium(tmg: TissueMultiGraph, clustering_data: pd.Data
             # No missing clusters, just use cluster types directly
             types = [f'Cluster_{cluster_id}' for cluster_id in unique_clusters]
         
-        # Create simple feature matrix (identity matrix)
+        # Create feature matrix based on average gene expression per type
         n_types = len(types)
-        feature_mat = np.eye(n_types)
+        n_genes = adata.shape[1]
+        feature_mat = np.full((n_types, n_genes), np.nan, dtype=np.float32)
+        
+        print(f"Computing average expression profiles for {n_types} cell types across {n_genes} genes...")
+        
+        for type_idx in range(n_types):
+            if has_missing_clusters and type_idx == 0:
+                # Handle "Unknown" type - cells with Type == 0
+                mask = adata.obs['Type'] == 0
+                type_name = "Unknown"
+            else:
+                # Handle regular cluster types
+                mask = adata.obs['Type'] == type_idx
+                type_name = types[type_idx]
+            
+            n_cells_in_type = mask.sum()
+            if n_cells_in_type > 0:
+                # Calculate mean expression across cells of this type
+                # Convert pandas Series mask to numpy array for sparse matrix indexing
+                mask_array = mask.values
+                if scipy.sparse.issparse(adata.X):
+                    # For sparse matrices, use mean and convert to dense
+                    feature_mat[type_idx, :] = adata.X[mask_array, :].mean(axis=0).A1
+                else:
+                    feature_mat[type_idx, :] = adata.X[mask_array, :].mean(axis=0)
+                
+                print(f"  {type_name}: {n_cells_in_type} cells, mean expression = {np.nanmean(feature_mat[type_idx, :]):.3f}")
+            else:
+                print(f"  Warning: {type_name} has 0 cells, using NaN expression profile (missing data)")
+                # feature_mat[type_idx, :] remains np.nan
         
         taxonomy = Taxonomy(name='xenium_graphclust', basepath=tmg.basepath,
                            Types=types, feature_mat=feature_mat)
+    
+    print(f"Created taxonomy with feature matrix shape: {taxonomy.feature_mat.shape}")
     
     # Add taxonomy to TMG
     tmg.Taxonomies.append(taxonomy)

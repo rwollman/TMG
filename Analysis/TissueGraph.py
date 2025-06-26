@@ -142,9 +142,6 @@ class TissueMultiGraph:
         # check if file exist in basepath
         self.basepath = basepath
 
-        # update self if this instance of TMG is with geoms or not
-        self.save_taxonomies = False
-
         warnings.filterwarnings('ignore', category=anndata.ImplicitModificationWarning)
         
         # create basepath if needed
@@ -241,12 +238,16 @@ class TissueMultiGraph:
         self.geom_to_layer_type_mapping = self._config["geom_to_layer_type_mapping"]
         self.layer_to_geom_type_mapping = self._config["layer_to_geom_type_mapping"]
 
-    def save(self):
+    def save(self, save_taxonomies=False):
         """ create the TMG.json and save everything.
         
         Saving simply iterates over all three types of objects (Layers, Taxonomies, Geom and call their respective save)
         Mapping between layers and layers/taxonomies are saved in a simple TMG.json file. 
         
+        Parameters
+        ----------
+        save_taxonomies : bool, default False
+            Whether to save taxonomy objects to disk
         """
         # make sure layers_graph is all int
         for i,lg in enumerate(self.layers_graph): 
@@ -271,12 +272,62 @@ class TissueMultiGraph:
                 _adata.obsm['XY'] = _adata.obsm['XY'].astype(np.float32)
             self.Layers[i].save()
         
-        if self.save_taxonomies: 
+        if save_taxonomies: 
             for Tx in self.Taxonomies: 
                 Tx.save()
               
         self.update_user("saved")
         
+    def save_geoms(self, geom_types=None, sections=None):
+        """Save geometries to disk.
+        
+        This method saves all loaded geometries in memory to disk. It's designed to be called
+        explicitly when needed, particularly after operations like extract_sections() that
+        may have geometries in memory but not yet saved to disk.
+        
+        Parameters
+        ----------
+        geom_types : list of str, optional
+            List of geometry types to save. If None, saves all loaded geometry types.
+        sections : list of str, optional  
+            List of section names to save geometries for. If None, saves for all sections.
+            
+        Returns
+        -------
+        int
+            Number of geometry files saved
+        """
+        if not hasattr(self, 'Geoms') or self.Geoms is None:
+            self.update_user("No geometries loaded in memory to save")
+            return 0
+            
+        saved_count = 0
+        sections_to_process = sections if sections is not None else self.unqS
+        
+        for section_idx, section_name in enumerate(self.unqS):
+            if section_name not in sections_to_process:
+                continue
+                
+            if section_idx >= len(self.Geoms) or self.Geoms[section_idx] is None:
+                continue
+                
+            section_geoms = self.Geoms[section_idx]
+            
+            for geom_type, geom_obj in section_geoms.items():
+                if geom_types is not None and geom_type not in geom_types:
+                    continue
+                    
+                if geom_obj is not None and geom_obj.polys is not None:
+                    try:
+                        geom_obj.save()
+                        self.update_user(f"Saved {geom_type} geometry for section {geom_obj.section}")
+                        saved_count += 1
+                    except Exception as e:
+                        self.update_user(f"Failed to save {geom_type} geometry for section {geom_obj.section}: {e}")
+        
+        self.update_user(f"Saved {saved_count} geometry files to disk")
+        return saved_count
+
     def load_geoms(self,sections = None, geom_types = None):
         # get section names 
         if sections is None: 
@@ -2518,10 +2569,22 @@ class Taxonomy:
         """
         if name is None: 
             raise ValueError("Taxonomy must get a name")
+            
         self.name = name
         self.basepath = basepath
-        self.adata = anndata.AnnData(X=feature_mat)
-        self.adata.obs["Type"] = Types
+        
+        # Handle feature matrix properly - don't let AnnData create a default matrix
+        if feature_mat is not None:
+            self.adata = anndata.AnnData(X=feature_mat)
+        else:
+            # Create empty AnnData with explicit empty sparse matrix to avoid identity matrix
+            import scipy.sparse
+            n_obs = len(Types) if Types is not None else 0
+            empty_matrix = scipy.sparse.csr_matrix((n_obs, 0))
+            self.adata = anndata.AnnData(X=empty_matrix)
+        
+        if Types is not None:
+            self.adata.obs["Type"] = Types
 
         # add RGB values if provided
         if rgb_codes is not None:
