@@ -28,8 +28,7 @@ from IPython.display import HTML
 
 import sys
 import time
-sys.path.append('/home/rwollman/MyProjects/AH/Repos/dredFISH')
-# from dredFISH.Utils.ConnectedComponentEntropy import ConnectedComponentEntropy
+from .ConnectedComponentEntropy import ConnectedComponentEntropy
 
 def list_entropy(X):
         _, cnt = np.unique(X, return_counts=True)
@@ -337,7 +336,7 @@ class GraphPercolation:
                     else: 
                         Zones[:,i] = np.arange(self.N)
             else: 
-                ent[i] = uf.merge_all(ELP[ix_to_merge,:2].astype(int))[-1]
+                ent[i] = uf.merge_all(ELP[ix_to_merge,:2].astype(np.int32))[-1]
                 if return_zones:
                     Zones[:,i] = [uf.find(c) for c in range(self.N)] 
         

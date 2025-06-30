@@ -47,7 +47,7 @@ cdef class ConnectedComponentEntropy:
         self.entropy += u_prev_size/self.n * log2(u_prev_size/self.n)
         self.entropy -=  self.size[v_root]/self.n * log2(self.size[v_root]/self.n)
 
-    cpdef merge_all(self, np.ndarray[np.int_t, ndim=2] pairs, float entropy_low_bound = 0.0):
+    cpdef merge_all(self, np.ndarray[np.int32_t, ndim=2] pairs, float entropy_low_bound = 0.0):
         cdef int i, num_pairs = pairs.shape[0]
         cdef double run_fraction
         cdef np.ndarray entropy_log = np.ones(num_pairs, dtype=np.float64) * entropy_low_bound
