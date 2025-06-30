@@ -104,6 +104,24 @@ class View:
             self.Panels[i].ax = ax
             plt.sca(ax)
             self.Panels[i].plot()
+    
+    def save(self, filename='figure', dpi=300, bbox_inches='tight'):
+        """
+        Save the figure to a PDF file.
+        
+        Parameters
+        ----------
+        filename : str, default 'figure.pdf'
+            The filename to save to. Should include .pdf extension.
+        dpi : int, default 300
+            Resolution of the saved figure.
+        bbox_inches : str, default 'tight'
+            Bounding box inches. 'tight' removes extra whitespace.
+        """
+        if not filename.endswith('.pdf'):
+            filename = filename + '.pdf'
+        self.fig.savefig(filename, dpi=dpi, bbox_inches=bbox_inches, format='pdf')
+        print(f"✓ Figure saved as PDF to: {filename}")
 
 class BasisView(View):
     def __init__(self,TMG,section = None, basis = np.arange(24), qntl = (0.025,0.975),colormaps="jet",subplot_layout = [1,1],**kwargs):
@@ -577,19 +595,25 @@ class CompositionMapWithLegendView(View):
                 print(f"Warning: Could not auto-calculate limits from XY data: {e}")
                 print("Using default hardcoded limits.")
         
-        # Create grid spec: map takes 70% width, legend takes 30% for bigger pie charts
-        gs = self.fig.add_gridspec(1, 2, wspace=0.02, width_ratios=[0.7, 0.3])
+        # APPROACH #1: Use fig.add_axes() directly for pixel-perfect control
+        # No gridspec, no automatic layout - manual positioning
+        
+        # Create map axes: left 70% of figure, full height with small margin
+        map_pos = [0.02, 0.02, 0.66, 0.96]  # [left, bottom, width, height]
+        
+        # Create legend axes: right 30% of figure, full height with small margin  
+        legend_pos = [0.70, 0.02, 0.28, 0.96]  # [left, bottom, width, height]
         
         # Create TypeMap panel for the composition layer
         geom_type = TMG.layer_to_geom_type_mapping[composition_layer_name]
         type_map = TypeMap(geom_type, V=self, section=section, 
-                          name=f"{composition_layer_name} Map", pos=gs[0], **kwargs)
+                          name=f"{composition_layer_name} Map", pos=map_pos, **kwargs)
         
         # Create CompositionLegend panel
         legend_kwargs = {k: v for k, v in kwargs.items() 
                         if k in ['min_wedge_threshold', 'pie_size', 'spacing']}
         composition_legend = CompositionLegend(V=self, composition_taxonomy=composition_taxonomy,
-                                             name=f"{composition_layer_name} Legend", pos=gs[1],
+                                             name=f"{composition_layer_name} Legend", pos=legend_pos,
                                              **legend_kwargs)
         
         # Debug: Print basic panel information
@@ -1654,7 +1678,7 @@ class CellCellInteractions(PolarPanel):
                 matrix_df,
                 space=self.space,
                 cmap=filtered_colors,
-                label_kws=self.label_kws,
+                label_kws={**self.label_kws, 'size': 14},
                 link_kws=self.link_kws
             )
             
@@ -1766,16 +1790,20 @@ class CompositionLegend(Panel):
         if n_compositions == 0:
             raise ValueError("No composition types to plot")
         
-        # Calculate layout - use full vertical space with minimal spacing
-        # Reduce spacing even further and increase chart size
-        effective_spacing = 0.01  # Very minimal spacing between charts
-        chart_height = (1.0 - (n_compositions - 1) * effective_spacing) / n_compositions
+        # Equal distribution of full height
+        chart_height = 1.0 / n_compositions
+        
+        # The radius will be a function of the available height to make it scale.
+        # A multiplier of 0.6 allows for some padding.
+        radius = chart_height * 0.6 * self.pie_size
+        
+        # Center the pie in the left portion of the panel.
+        # Position it one radius length from the left edge plus a small margin.
+        pie_center_x = radius + 0.05
         
         for i, comp_type in enumerate(self.composition_types):
-            # Calculate position for this pie chart
-            y_pos = 1.0 - (i + 1) * chart_height - i * effective_spacing
-            chart_center_x = 0.25  # Move charts slightly more to the left for larger pies
-            chart_center_y = y_pos + chart_height / 2
+            # Center of each vertical slice
+            chart_center_y = (i + 0.5) * chart_height
             
             # Get composition values for this type
             comp_values = self.feature_mat[i, :]
@@ -1799,30 +1827,26 @@ class CompositionLegend(Panel):
             normalized_values = filtered_values / total_value
             print(f"     Normalized values: {normalized_values}")
             
-            # Create larger pie charts - use more of the available space
-            radius = min(chart_height * 0.45, 0.08) * self.pie_size  # Larger radius with maximum cap
-            print(f"     Radius: {radius}")
-            
             try:
                 wedges, texts = self.ax.pie(
                     normalized_values,
                     colors=filtered_colors,
-                    center=(chart_center_x, chart_center_y),
+                    center=(pie_center_x, chart_center_y),
                     radius=radius,
                     startangle=90,
-                    textprops={'fontsize': 8}
+                    textprops={'fontsize': 12}
                 )
                 print(f"     ✓ Successfully created pie chart with {len(wedges)} wedges")
                 
-                # Add composition type label with matching color from composition taxonomy
-                label_x = chart_center_x + radius + 0.03  # Position to the right of pie chart
+                # Position the label to the right of the pie, after its full diameter.
+                label_x = (pie_center_x + radius) + 0.05
                 label_y = chart_center_y
                 self.ax.text(
                     label_x, label_y,
                     comp_type,
                     ha='left', va='center',
                     color=self.composition_colors[i],
-                    fontsize=10,
+                    fontsize=16,
                     fontweight='bold'
                 )
                 print(f"     ✓ Added label '{comp_type}' at ({label_x:.3f}, {label_y:.3f})")
@@ -1831,11 +1855,16 @@ class CompositionLegend(Panel):
                 print(f"     ❌ Error creating pie chart: {e}")
                 raise
         
-        # Set axis properties
+
+        # Set axis properties to use full panel space with no margins
         self.ax.set_xlim(0, 1)
         self.ax.set_ylim(0, 1)
-        self.ax.set_aspect('equal')
+        # Remove set_aspect('equal') to allow axis to fill full height
+        # The pie charts should still be circular due to matplotlib's pie() function
         self.ax.axis('off')
-        print(f"✓ Created {n_compositions} pie charts with colored labels")
+        
+
+        
+        print(f"✓ Created {n_compositions} pie charts filling the full panel space")
 
 
