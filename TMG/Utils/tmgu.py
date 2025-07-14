@@ -35,6 +35,34 @@ def list_entropy(X):
         freq = cnt / len(X)
         return -(np.sum(freq * np.log2(freq)))
 
+def joint_entropy(x, y):
+    """
+    Calculate the joint entropy of two vectors.
+    
+    Args:
+        x (array-like): First vector
+        y (array-like): Second vector
+    
+    Returns:
+        float: Joint entropy H(X,Y)
+    """
+    # Convert to numpy arrays if needed
+    x = np.array(x)
+    y = np.array(y)
+    
+    # Create joint distribution by pairing elements
+    joint_values = list(zip(x, y))
+    
+    # Get unique joint values and their counts
+    _, cnt = np.unique(joint_values, axis=0, return_counts=True)
+    
+    # Calculate frequencies
+    freq = cnt / len(joint_values)
+    
+    # Calculate joint entropy
+    return -(np.sum(freq * np.log2(freq)))
+
+
 def edge_list_from_XY_with_max_dist(XY,max_dist):
     nbrs = NearestNeighbors(radius = max_dist, algorithm = 'ball_tree').fit(XY)
     distances, indices = nbrs.radius_neighbors(XY)
