@@ -418,6 +418,7 @@ class GraphPercolation:
     def score(self):
         dent = self.ent_perm-self.ent_real
         scr = np.trapz(np.abs(dent), x=self.pbond_vec, axis=0)
+        scr = scr / np.log2(self.N)
         return scr
     
     def plot_entropy_by_type(self, ax = None):
@@ -509,8 +510,8 @@ class GraphPercolation:
 
 def merge_nested_clusters(GPmat, top_down = True): 
 
-    Ncells = sum(GPmat[i,0].N for i in range(GPmat.shape[0]))
-
+    Ncells_vec = np.array([GPmat[i,0].N for i in range(GPmat.shape[0])])
+    Ncells = Ncells_vec.sum()
     # create the type matrix from GP objects: 
     type_vecs=list()
     for row in GPmat: 
@@ -551,10 +552,9 @@ def merge_nested_clusters(GPmat, top_down = True):
         dent_by_type_by_section_for_curr_types = delta_ent_per_pbond[curr_ix,:,:]
         freq_by_type_by_section_for_curr_types = cmsm_type_freq[curr_ix,:,np.newaxis]
         dent_by_section_summed_over_types = (dent_by_type_by_section_for_curr_types * freq_by_type_by_section_for_curr_types).sum(axis=0)
-        dent_by_pbond = dent_by_section_summed_over_types.sum(axis=0)
-        # scr = np.trapz(dent_by_pbond,GPmat[0,0].pbond_vec)
-        scr = dent_by_pbond.mean()
-
+        dent_by_section = dent_by_section_summed_over_types.mean(axis=1)
+        frac_dent_by_section = dent_by_section/np.log2(Ncells_vec)
+        scr = frac_dent_by_section.mean()
         return scr
 
     # now create the mapping dict so that each type (key) has the list of subtype under it (values)
