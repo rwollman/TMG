@@ -519,7 +519,7 @@ def merge_nested_clusters(GPmat, top_down = True):
     type_int_mat = np.vstack(type_vecs)
     Ntypes_per_lvl = (type_int_mat.max(axis=0)+1).astype(int)
 
-    # now extract the type entropy from each GO object to create the overall type x entropy across all possible types (mutliple levels)
+    # now extract the type entropy from each GP object to create the overall type x entropy across all possible types (mutliple levels)
     
     # Init all empty matrices inside the list
     delta_ent_per_pbond_type_lvl = [None] * GPmat.shape[1]
@@ -534,7 +534,8 @@ def merge_nested_clusters(GPmat, top_down = True):
         for sec in range(GPmat.shape[0]): 
             types_in_section,type_freq = np.unique(GPmat[sec,lvl].type_vec,return_counts=True)
             type_freq_lvl[lvl][types_in_section.astype(int),sec] = type_freq/Ncells
-            dent = np.abs(GPmat[sec,lvl].ent_type_perm.T-GPmat[sec,lvl].ent_type_real.T) 
+            dent = np.abs(GPmat[sec,lvl].ent_type_perm.T-GPmat[sec,lvl].ent_type_real.T)
+            dent /= np.log2(GPmat[sec,lvl].N) 
             delta_ent_per_pbond_type_lvl[lvl][types_in_section.astype(int),sec,:] = dent
 
 
@@ -552,9 +553,9 @@ def merge_nested_clusters(GPmat, top_down = True):
         dent_by_type_by_section_for_curr_types = delta_ent_per_pbond[curr_ix,:,:]
         freq_by_type_by_section_for_curr_types = cmsm_type_freq[curr_ix,:,np.newaxis]
         dent_by_section_summed_over_types = (dent_by_type_by_section_for_curr_types * freq_by_type_by_section_for_curr_types).sum(axis=0)
-        dent_by_section = dent_by_section_summed_over_types.mean(axis=1)
-        frac_dent_by_section = dent_by_section/np.log2(Ncells_vec)
-        scr = frac_dent_by_section.mean()
+        dent_by_pbond = dent_by_section_summed_over_types.sum(axis=0)
+        scr = dent_by_pbond.mean()
+
         return scr
 
     # now create the mapping dict so that each type (key) has the list of subtype under it (values)
