@@ -596,20 +596,23 @@ def merge_nested_clusters(GPmat, top_down = True):
                         improved = True
         type_vec = cmsm_type_mat[np.isin(cmsm_type_mat,curr_ix)]
     else: #i.e. bottom up
-        keys_per_level = [np.unique(cmsm_type_mat[:, lvl]) for lvl in range(5)]
+        keys_per_level = [np.unique(cmsm_type_mat[:, lvl]) for lvl in range(4)]
 
-        for lvl in range(3, -1, -1):
+        for lvl in range(2, -1, -1):  # Start from level 2, not 3, since level 3 has no children
             print(f"starting level: {lvl}")
             improved = True
-            for key in keys_per_level[lvl]:  # Loop over keys at the current level
-                subtypes = adj_dict[key]
-                if all(subtype in curr_ix for subtype in subtypes): 
-                    new_ix = [ix for ix in curr_ix if ix not in subtypes] + [key]
-                    new_score = score(new_ix)
-                    if new_score > best_score:
-                        curr_ix = new_ix
-                        best_score = new_score
-                        improved = True
+            while improved:
+                improved = False
+                for key in keys_per_level[lvl]:  # Loop over keys at the current level
+                    if key in adj_dict:  # Check if key exists in adj_dict
+                        subtypes = adj_dict[key]
+                        if all(subtype in curr_ix for subtype in subtypes): 
+                            new_ix = [ix for ix in curr_ix if ix not in subtypes] + [key]
+                            new_score = score(new_ix)
+                            if new_score > best_score:
+                                curr_ix = new_ix
+                                best_score = new_score
+                                improved = True
         mask = np.isin(cmsm_type_mat,curr_ix)
         new_mask = np.full(mask.shape, False)
         last_true_indices = mask.shape[1] - np.argmax(mask[:, ::-1], axis=1) - 1
