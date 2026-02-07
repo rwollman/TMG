@@ -549,14 +549,38 @@ def merge_nested_clusters(GPmat, top_down = True):
     delta_ent_per_pbond = np.concatenate(delta_ent_per_pbond_type_lvl,axis=0)
     cmsm_type_freq = np.concatenate(type_freq_lvl,axis=0)
 
+    # Pre-compute type contributions for optimization
+    def precompute_type_contributions(delta_ent_per_pbond, cmsm_type_freq):
+        """Pre-compute the score contribution of each type (summed over sections, per bond)"""
+        print("Computing type contributions...")
+        n_types = delta_ent_per_pbond.shape[0]
+        n_bonds = delta_ent_per_pbond.shape[2]
+        contributions = np.zeros((n_types, n_bonds))
+        
+        for i in range(n_types):
+            if i % 1000 == 0:
+                print(f"  Computing contribution {i}/{n_types}")
+            freq = cmsm_type_freq[i,:,np.newaxis]  # shape: (sections, 1)
+            dent = delta_ent_per_pbond[i,:,:]      # shape: (sections, bonds)
+            # Sum over sections to get contribution per bond for this type
+            contributions[i, :] = (dent * freq).sum(axis=0)  # shape: (bonds,)
+        
+        return contributions
+
     def score(curr_ix):
+        """Original slow score function - kept for top_down case"""
         dent_by_type_by_section_for_curr_types = delta_ent_per_pbond[curr_ix,:,:]
         freq_by_type_by_section_for_curr_types = cmsm_type_freq[curr_ix,:,np.newaxis]
         dent_by_section_summed_over_types = (dent_by_type_by_section_for_curr_types * freq_by_type_by_section_for_curr_types).sum(axis=0)
         dent_by_pbond = dent_by_section_summed_over_types.sum(axis=0)
         scr = dent_by_pbond.mean()
-
         return scr
+    
+    def fast_score(curr_ix_list, type_contributions_per_bond):
+        """Fast score calculation using pre-computed contributions"""
+        # Sum contributions over selected types, then take mean over bonds
+        total_per_bond = type_contributions_per_bond[curr_ix_list, :].sum(axis=0)
+        return total_per_bond.mean()
 
     # now create the mapping dict so that each type (key) has the list of subtype under it (values)
     # Initialize an empty dictionary
@@ -578,41 +602,139 @@ def merge_nested_clusters(GPmat, top_down = True):
         curr_ix = list(np.unique(cmsm_type_mat[:,0]))
     else: #i.e. bottom up
         curr_ix = list(np.unique(cmsm_type_mat[:,-1]))
-
+    
     best_score = score(curr_ix)
 
     improved = True
     if top_down: 
+        print("*** OPTIMIZED TOP-DOWN ALGORITHM ***")
+        
+        # Pre-compute all type contributions once (major optimization!)
+        type_contributions_per_bond = precompute_type_contributions(delta_ent_per_pbond, cmsm_type_freq)
+        
+        curr_ix_set = set(curr_ix)
+        current_score = fast_score(curr_ix, type_contributions_per_bond)
+        iteration_count = 0
+        
+        print(f"Initial curr_ix size: {len(curr_ix)}, initial score: {current_score:.6f}")
+        
         while improved:
+            iteration_count += 1
             improved = False
+            improvements_this_round = 0
+            
+            print(f"\n--- Iteration {iteration_count} ---")
+            t0 = time.time()
+            
             for i in range(len(curr_ix)):
                 if curr_ix[i] in adj_dict:
-                    new_ix = curr_ix[:i] + curr_ix[i+1:] + adj_dict[curr_ix[i]]
-                    # new_score = np.sum(delta_ent_per_pbond[new_ix, :] * cmsm_type_freq[new_ix, :],axis=0).mean()
-                    new_score = score(new_ix)
-                    if new_score > best_score:
-                        curr_ix = new_ix
-                        best_score = new_score
+                    subtypes = adj_dict[curr_ix[i]]
+                    
+                    # Calculate score change incrementally (MUCH faster!)
+                    old_contribution_per_bond = type_contributions_per_bond[curr_ix[i], :]
+                    new_contribution_per_bond = type_contributions_per_bond[subtypes, :].sum(axis=0)
+                    score_change = (new_contribution_per_bond - old_contribution_per_bond).mean()
+                    new_score = current_score + score_change
+                    
+                    if new_score > current_score:
+                        # Update curr_ix and curr_ix_set efficiently
+                        curr_ix_set.remove(curr_ix[i])
+                        curr_ix = curr_ix[:i] + curr_ix[i+1:] + subtypes
+                        curr_ix_set.update(subtypes)
+                        current_score = new_score
                         improved = True
+                        improvements_this_round += 1
+                        
+                        # Report improvement
+                        print(f"    Improvement #{improvements_this_round}: replaced {len([curr_ix[i]])} with {len(subtypes)} types, "
+                              f"score: {current_score:.6f}, curr_ix size: {len(curr_ix)}")
+                        break  # Start over since curr_ix changed
+            
+            elapsed = time.time() - t0
+            print(f"Iteration {iteration_count} complete:")
+            print(f"  Time: {elapsed:.2f}s")
+            print(f"  Improvements: {improvements_this_round}")
+            print(f"  Current score: {current_score:.6f}")
+            print(f"  Current curr_ix size: {len(curr_ix)}")
+            
+        best_score = current_score
+        print(f"\n*** TOP-DOWN OPTIMIZATION COMPLETE ***")
+        print(f"Final score: {best_score:.6f}")
+        print(f"Final size: {len(curr_ix)}")
+        print(f"Total iterations: {iteration_count}")
+        
         type_vec = cmsm_type_mat[np.isin(cmsm_type_mat,curr_ix)]
-    else: #i.e. bottom up
+    else: #i.e. bottom up - OPTIMIZED VERSION
+        print("*** OPTIMIZED BOTTOM-UP ALGORITHM ***")
+        
+        # Pre-compute all type contributions once (major optimization!)
+        type_contributions_per_bond = precompute_type_contributions(delta_ent_per_pbond, cmsm_type_freq)
+        
         keys_per_level = [np.unique(cmsm_type_mat[:, lvl]) for lvl in range(4)]
-
-        for lvl in range(2, -1, -1):  # Start from level 2, not 3, since level 3 has no children
-            print(f"starting level: {lvl}")
-            improved = True
-            while improved:
-                improved = False
-                for key in keys_per_level[lvl]:  # Loop over keys at the current level
-                    if key in adj_dict:  # Check if key exists in adj_dict
-                        subtypes = adj_dict[key]
-                        if all(subtype in curr_ix for subtype in subtypes): 
-                            new_ix = [ix for ix in curr_ix if ix not in subtypes] + [key]
-                            new_score = score(new_ix)
-                            if new_score > best_score:
-                                curr_ix = new_ix
-                                best_score = new_score
-                                improved = True
+        curr_ix_set = set(curr_ix)
+        current_score = fast_score(curr_ix, type_contributions_per_bond)
+        
+        print(f"Initial curr_ix size: {len(curr_ix)}, initial score: {current_score:.6f}")
+        print(f"Keys per level: {[len(keys) for keys in keys_per_level]}")
+        
+        for lvl in range(2, -1, -1):
+            t0 = time.time()
+            print(f"\n--- Starting level: {lvl} ---")
+            print(f"Number of keys at level {lvl}: {len(keys_per_level[lvl])}")
+            
+            improved_count = 0
+            keys_with_valid_subtypes = 0
+            
+            for ii, key in enumerate(keys_per_level[lvl]):
+                # Progress update less frequently to reduce overhead
+                if ii % 200 == 0:
+                    elapsed = time.time() - t0
+                    rate = ii / elapsed if elapsed > 0 else 0
+                    remaining = (len(keys_per_level[lvl]) - ii) / rate if rate > 0 else float('inf')
+                    print(f"  Progress: {ii}/{len(keys_per_level[lvl])} ({100*ii/len(keys_per_level[lvl]):.1f}%) - "
+                          f"improvements: {improved_count} - rate: {rate:.1f} keys/s - ETA: {remaining:.1f}s")
+                
+                if key not in adj_dict:
+                    continue
+                    
+                subtypes = adj_dict[key]
+                if all(subtype in curr_ix_set for subtype in subtypes):
+                    keys_with_valid_subtypes += 1
+                    
+                    # Calculate score change incrementally (MUCH faster than recalculating everything!)
+                    old_contribution_per_bond = type_contributions_per_bond[subtypes, :].sum(axis=0)  # sum over subtypes
+                    new_contribution_per_bond = type_contributions_per_bond[key, :]
+                    score_change = (new_contribution_per_bond - old_contribution_per_bond).mean()
+                    new_score = current_score + score_change
+                    
+                    if new_score > current_score:
+                        # Update curr_ix and curr_ix_set efficiently
+                        for subtype in subtypes:
+                            curr_ix.remove(subtype)
+                            curr_ix_set.remove(subtype)
+                        curr_ix.append(key)
+                        curr_ix_set.add(key)
+                        current_score = new_score
+                        improved_count += 1
+                        
+                        # Report significant improvements
+                        if improved_count <= 50 or improved_count % 50 == 0:
+                            print(f"    Improvement #{improved_count}: key={key}, score: {current_score:.6f}, "
+                                  f"curr_ix size: {len(curr_ix)} (merged {len(subtypes)} -> 1)")
+            
+            elapsed = time.time() - t0
+            print(f"Level {lvl} complete:")
+            print(f"  Time: {elapsed:.1f}s")
+            print(f"  Improvements: {improved_count}")
+            print(f"  Keys with valid subtypes: {keys_with_valid_subtypes}/{len(keys_per_level[lvl])}")
+            print(f"  Final score: {current_score:.6f}")
+            print(f"  Final curr_ix size: {len(curr_ix)}")
+        
+        best_score = current_score
+        print(f"\n*** OPTIMIZATION COMPLETE ***")
+        print(f"Final score: {best_score:.6f}")
+        print(f"Final size: {len(curr_ix)}")
+        
         mask = np.isin(cmsm_type_mat,curr_ix)
         new_mask = np.full(mask.shape, False)
         last_true_indices = mask.shape[1] - np.argmax(mask[:, ::-1], axis=1) - 1
