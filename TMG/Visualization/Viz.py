@@ -1142,39 +1142,6 @@ class LegendWithCirclesAndWedges(LegendWithCircles):
         self.ax.set_xticks([])
         self.ax.set_yticks([])
 
-
-
-
-  commented section was used to plot Cond Entropy Vs resolution, not clear if that is a panel
-    
-        # add a panel with conditional entropy
-        if hasattr(self.TMG.Layers[0], 'cond_entropy_df') and self.lvl==1:
-            EntropyCalcsL1 = self.TMG.Layers[0].cond_entropy_df
-            fig = plt.figure()
-         
-            ax1 = plt.gca()
-            yopt = self.TMG.cond_entropy[1]
-            xopt = self.TMG.Ntypes[1]
-            ax1.plot(EntropyCalcsL1['Ntypes'],EntropyCalcsL1['Entropy'])
-            ylm = ax1.get_ylim()
-            ax1.plot([xopt,xopt],[ylm[0], yopt],'r--',linewidth=1)
-            ax1.set_xlabel('# of types',fontsize=18)
-            ax1.set_ylabel('H (Map | Type)',fontsize=18)
-            fig = plt.gcf()
-            left, bottom, width, height = [0.6, 0.55, 0.25, 0.25]
-            ax2 = fig.add_axes([left, bottom, width, height])
-            ax2.semilogx(EntropyCalcsL1['Ntypes'],EntropyCalcsL1['Entropy'])
-            ylm = ax2.get_ylim()
-            ax2.plot([xopt,xopt],[ylm[0], yopt],'r--',linewidth=1)
-            
-            fig = plt.figure()
-            unq,cnt = np.unique(self.TMG.Layers[0].Type,return_counts=True)
-            plt.hist(cnt,bins=15);
-            plt.title("Cells per type")
-            plt.xlabel("# Cells in a type")
-            plt.ylabel("# of Types")
-
-
 class RegionMap(CellMap): 
     def __init__(self,name = "region map"):
         super().__init__(TMG,name = name)
