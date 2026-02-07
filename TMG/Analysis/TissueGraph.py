@@ -212,7 +212,13 @@ class TissueMultiGraph:
     def _load(self):
         with open(os.path.join(self.basepath,"TMG.json"),encoding="utf-8") as fh:
             self._config = json.load(fh)
-        self.input_df = pd.DataFrame(self._config["input_dfs"])
+        
+        # Handle case where input_dfs might be empty (when TMG was created manually)
+        if self._config["input_dfs"] and len(self._config["input_dfs"]) > 0:
+            self.input_df = pd.DataFrame(self._config["input_dfs"])
+        else:
+            self.input_df = None
+            
         # Load Taxonomies: 
         TaxNameList = self._config["tax_types"]
         Tax_path_list = self._config["tax_paths"]
@@ -252,7 +258,13 @@ class TissueMultiGraph:
         # make sure layers_graph is all int
         for i,lg in enumerate(self.layers_graph): 
             self.layers_graph[i]=(int(lg[0]),int(lg[1]))
-        input_df_dict = self.input_df.to_dict('list')
+        
+        # Handle case where input_df is None (when TMG is created manually)
+        if self.input_df is not None:
+            input_df_dict = self.input_df.to_dict('list')
+        else:
+            input_df_dict = {}
+            
         self._config = { "layers_graph" : self.layers_graph, 
                          "layer_taxonomy_mapping" : self.layer_taxonomy_mapping, 
                          "layer_to_geom_type_mapping" : self.layer_to_geom_type_mapping,
@@ -753,6 +765,81 @@ class TissueMultiGraph:
         # Update layers graph
         self.layers_graph.append((base_layer_id,merged_layer_id))
 
+    def build_merged_layer_SG(TMG, merged_layer_id=1, base_layer_id=0):
+        """
+        Create a spatial graph for a merged layer with edge weights representing 
+        the number of base layer connections between merged nodes.
+        
+        This is a variant that preserves information about the strength of 
+        connections between merged layer nodes.
+        
+        Parameters
+        ----------
+        TMG : TissueMultiGraph
+            The TissueMultiGraph object containing the layers
+        merged_layer_id : int, default 1
+            Index of the merged layer to create spatial graph for
+        base_layer_id : int, default 0 
+            Index of the base layer that contains the spatial graph
+            
+        Returns
+        -------
+        igraph.Graph
+            Weighted spatial graph for the merged layer where edge weights 
+            represent the number of base layer connections
+        """
+        
+        # Validate inputs (same as above)
+        if len(TMG.Layers) <= max(merged_layer_id, base_layer_id):
+            raise ValueError(f"Layer indices out of range. TMG has {len(TMG.Layers)} layers.")
+        
+        base_layer = TMG.Layers[base_layer_id] 
+        merged_layer = TMG.Layers[merged_layer_id]
+        
+        if base_layer.SG is None:
+            raise ValueError(f"Base layer {base_layer_id} does not have a spatial graph.")
+        
+        if merged_layer.Upstream is None:
+            raise ValueError(f"Merged layer {merged_layer_id} does not have Upstream mapping.")
+        
+        upstream_mapping = np.array(merged_layer.Upstream)
+        
+        if len(upstream_mapping) != base_layer.N:
+            raise ValueError(f"Upstream mapping length mismatch.")
+        
+        # Get base layer edges and map to merged layer
+        base_edge_list = base_layer.spatial_edge_list
+        merged_edges_from = upstream_mapping[base_edge_list[:, 0]]
+        merged_edges_to = upstream_mapping[base_edge_list[:, 1]]
+        
+        # Count connections between each pair of merged layer nodes
+        edge_counts = defaultdict(int)
+        
+        for from_node, to_node in zip(merged_edges_from, merged_edges_to):
+            if from_node != to_node:  # Skip self-connections
+                # Ensure consistent edge ordering (smaller node first)
+                edge_key = tuple(sorted([from_node, to_node]))
+                edge_counts[edge_key] += 1
+        
+        # Create edge list and weights
+        edges = list(edge_counts.keys())
+        weights = list(edge_counts.values())
+        
+        # Create weighted graph
+        n_merged_nodes = merged_layer.N
+        merged_SG = igraph.Graph(n=n_merged_nodes, edges=edges, directed=False)
+        merged_SG.es['weight'] = weights
+        
+        # Update the merged layer
+        merged_layer.SG = merged_SG
+        merged_layer.adata.obsp["SG"] = merged_SG.get_adjacency_sparse()
+        
+        TMG.update_user(f"Created weighted spatial graph for layer {merged_layer_id} with "
+                    f"{merged_SG.vcount()} nodes and {merged_SG.ecount()} edges")
+        
+        return merged_SG
+
+    
     def find_upstream_layer(self, layer_id):
         """
         Use the layer graph to find the layer_id's upstream layer
@@ -1777,11 +1864,13 @@ class TissueGraph:
             XY : dependent property - will query info from anndata and return
         """
         if self.adata is None:
-            return None
+            XY = None
         elif self.adata_mapping["XY"] not in self.adata.obsm.keys(): 
             raise ValueError("Mapping of XY to AnnData is broken, please check!")
         else: 
-            return self.adata.obsm[self.adata_mapping["XY"]].copy()
+            XY = self.adata.obsm[self.adata_mapping["XY"]].copy()
+        XY = np.array(XY)
+        return XY
 
     def get_XY(self,section = None):
         if section is None: 
@@ -1961,15 +2050,15 @@ class TissueGraph:
         """
         unqS = self.unqS
         self.update_user(f"Building spatial graphs for {self.Nsections} sections")
-        # section = self.Section.reset_index(drop=True)
-        # sorted_section = section.sort_values().reset_index(drop=True)
-        # if not np.all(sorted_section == section):
-        #     raise ValueError("Sections are not sorted. Please sort the sections before building the spatial graph.")
+        section = self.Section.reset_index(drop=True)
+        sorted_section = section.sort_values().reset_index(drop=True)
+        if not np.all(sorted_section == section):
+            raise ValueError("Sections are not sorted. Please sort the sections before building the spatial graph.")
         # # self.adata = self.adata[self.adata.obs[self.adata_mapping['Section']].argsort()]
         self.SG = list()
         for s in range(self.Nsections): 
             # get XY for a given section
-            XY_per_section = self.XY[self.Section==unqS[s],:]
+            XY_per_section = self.get_XY(unqS[s])
             self.SG.append(geomu.spatial_graph_from_XY(XY_per_section,max_dist=max_dist))
             
         # to merge the spatial graphs into one with many components: 
