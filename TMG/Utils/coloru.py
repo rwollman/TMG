@@ -2,18 +2,153 @@
 # from colormath.color_objects import sRGBColor, LabColor
 # from colormath.color_conversions import convert_color
 # from colormath.color_diff import delta_e_cie2000, delta_e_cie1976
-from scipy.cluster import hierarchy 
 import numpy as np
-
 import random
-import itertools
-
 import umap
-
 import matplotlib.cm as cm
 from matplotlib.colors import LinearSegmentedColormap
-
 from scipy.spatial.distance import pdist
+from scipy.cluster import hierarchy 
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.optimize import linear_sum_assignment
+from scipy.stats import pearsonr, spearmanr
+from scipy.spatial.distance import squareform
+import itertools
+import time
+from typing import Tuple, Dict, List, Optional, Union
+import warnings
+
+
+def _rgb_to_xyz(rgb):
+    """Convert RGB to XYZ color space"""
+    # Normalize RGB values to 0-1 if they're in 0-255 range
+    if np.any(rgb > 1.0):
+        rgb = rgb / 255.0
+    
+    # Apply gamma correction (sRGB to linear RGB)
+    rgb_linear = np.where(rgb <= 0.04045, rgb / 12.92, np.power((rgb + 0.055) / 1.055, 2.4))
+    
+    # Convert to XYZ using sRGB matrix
+    matrix = np.array([
+        [0.4124564, 0.3575761, 0.1804375],
+        [0.2126729, 0.7151522, 0.0721750],
+        [0.0193339, 0.1191920, 0.9503041]
+    ])
+    
+    xyz = rgb_linear @ matrix.T
+    return xyz
+
+def _xyz_to_lab(xyz):
+    """Convert XYZ to LAB color space"""
+    # D65 illuminant reference white
+    xn, yn, zn = 0.95047, 1.00000, 1.08883
+    
+    # Normalize by reference white
+    xyz_norm = xyz / np.array([xn, yn, zn])
+    
+    # Apply LAB transformation
+    def f(t):
+        delta = 6.0 / 29.0
+        return np.where(t > delta**3, np.power(t, 1.0/3.0), t / (3 * delta**2) + 4.0/29.0)
+    
+    fx, fy, fz = f(xyz_norm[0]), f(xyz_norm[1]), f(xyz_norm[2])
+    
+    L = 116 * fy - 16
+    a = 500 * (fx - fy)
+    b = 200 * (fy - fz)
+    
+    return np.array([L, a, b])
+
+def _lab_to_xyz(lab):
+    """Convert LAB to XYZ color space"""
+    L, a, b = lab[0], lab[1], lab[2]
+    
+    # D65 illuminant reference white
+    xn, yn, zn = 0.95047, 1.00000, 1.08883
+    
+    # Calculate intermediate values
+    fy = (L + 16) / 116
+    fx = a / 500 + fy
+    fz = fy - b / 200
+    
+    # Apply inverse transformation
+    def f_inv(t):
+        delta = 6.0 / 29.0
+        return np.where(t > delta, t**3, 3 * delta**2 * (t - 4.0/29.0))
+    
+    x = xn * f_inv(fx)
+    y = yn * f_inv(fy)
+    z = zn * f_inv(fz)
+    
+    return np.array([x, y, z])
+
+def _xyz_to_rgb(xyz):
+    """Convert XYZ to RGB color space"""
+    # Convert from XYZ to linear RGB using inverse sRGB matrix
+    matrix_inv = np.array([
+        [ 3.2404542, -1.5371385, -0.4985314],
+        [-0.9692660,  1.8760108,  0.0415560],
+        [ 0.0556434, -0.2040259,  1.0572252]
+    ])
+    
+    rgb_linear = xyz @ matrix_inv.T
+    
+    # Apply inverse gamma correction (linear RGB to sRGB)
+    rgb = np.where(rgb_linear <= 0.0031308, 
+                   12.92 * rgb_linear, 
+                   1.055 * np.power(rgb_linear, 1.0/2.4) - 0.055)
+    
+    return np.clip(rgb, 0, 1)
+
+def rgb_to_lab(rgb):
+    """Convert RGB to LAB color space"""
+    xyz = _rgb_to_xyz(rgb)
+    lab = _xyz_to_lab(xyz)
+    return lab
+
+def lab_to_rgb(lab):
+    """Convert LAB to RGB color space"""
+    xyz = _lab_to_xyz(lab)
+    rgb = _xyz_to_rgb(xyz)
+    return rgb
+
+def delta_e_cie1976(lab1, lab2):
+    """Calculate CIE 1976 Delta E color difference"""
+    return np.sqrt(np.sum((lab1 - lab2) ** 2))
+
+def delta_e_cie2000(lab1, lab2):
+    """Calculate CIE 2000 Delta E color difference (simplified version)"""
+    # This is a simplified implementation of CIE 2000
+    # For a full implementation, the formula is quite complex
+    # This provides a reasonable approximation
+    L1, a1, b1 = lab1[0], lab1[1], lab1[2]
+    L2, a2, b2 = lab2[0], lab2[1], lab2[2]
+    
+    # Calculate differences
+    dL = L1 - L2
+    da = a1 - a2
+    db = b1 - b2
+    
+    # Calculate C values
+    C1 = np.sqrt(a1**2 + b1**2)
+    C2 = np.sqrt(a2**2 + b2**2)
+    dC = C1 - C2
+    
+    # Calculate dH
+    dH_squared = da**2 + db**2 - dC**2
+    dH = np.sqrt(max(0, dH_squared))
+    
+    # Weighting functions (simplified) - use average chroma for symmetry
+    C_avg = (C1 + C2) / 2.0
+    SL = 1.0
+    SC = 1.0 + 0.045 * C_avg
+    SH = 1.0 + 0.015 * C_avg
+    
+    # Calculate Delta E 2000
+    delta_e = np.sqrt((dL/SL)**2 + (dC/SC)**2 + (dH/SH)**2)
+    return delta_e
 
 def rgb_to_xyz(rgb):
     """
@@ -215,13 +350,17 @@ def color_diff_vec(clr1, clr2, mode="RGB", de="1976"):
 def convert_lab01_2rgb(clr_best):
     if clr_best.shape[1] != 3:
         sz = int(len(clr_best)/3)
-        clr_best = np.reshape(clr_best,(sz,3))
+        clr_best = np.reshape(clr_best, (sz, 3))
     clr_rgb = np.zeros(clr_best.shape)
     for i in range(clr_rgb.shape[0]):
-        clr_lab = LabColor(clr_best[i,0]*100,(clr_best[i,1]-0.5)*255,(clr_best[i,2]-0.5)*255)
-        clr_rgb[i,:] = np.array(convert_color(clr_lab,sRGBColor).get_value_tuple())
+        # Convert normalized Lab (0-1) to actual Lab values
+        L = clr_best[i, 0] * 100
+        a = (clr_best[i, 1] - 0.5) * 255
+        b = (clr_best[i, 2] - 0.5) * 255
+        lab = np.array([L, a, b])
+        clr_rgb[i, :] = lab_to_rgb(lab)
 
-    clr_rgb = np.clip(clr_rgb,0,1)
+    clr_rgb = np.clip(clr_rgb, 0, 1)
     return clr_rgb
 
 def rand_hex_codes(n):
@@ -296,6 +435,7 @@ def merge_colormaps(colormap_names,clr_range = (0,1),res = 128):
     mymap = LinearSegmentedColormap.from_list('my_colormap', colors)
     return mymap
 
+<<<<<<< HEAD
 def hex_color_distance_matrix(hex_codes, de="1976"):
     """
     Compute deltaE distance matrix between hex color codes in CIELAB space.
@@ -503,3 +643,533 @@ def greedy_color_assignment(
         final_assignments[actual_type_idx] = color_hex
     
     return final_assignments
+
+
+class DistanceMatrixOptimizer:
+    """
+    Class to find optimal permutation between two distance matrices.
+    """
+    
+    def __init__(self, Dopt: np.ndarray, Dclr: np.ndarray, 
+                 correlation_type: str = 'pearson'):
+        """
+        Initialize the optimizer.
+        
+        Parameters:
+        -----------
+        Dopt : np.ndarray
+            Reference distance matrix (n x n)
+        Dclr : np.ndarray  
+            Distance matrix to be permuted (n x n)
+        correlation_type : str
+            Type of correlation to maximize ('pearson' or 'spearman')
+        """
+        self.Dopt = np.array(Dopt)
+        self.Dclr = np.array(Dclr)
+        self.n = self.Dopt.shape[0]
+        self.correlation_type = correlation_type
+        
+        # Validate inputs
+        self._validate_inputs()
+        
+        # Store results
+        self.results = {}
+        
+    def _validate_inputs(self):
+        """Validate input matrices."""
+        if self.Dopt.shape != self.Dclr.shape:
+            raise ValueError("Distance matrices must have the same shape")
+        
+        if not (self.Dopt.shape[0] == self.Dopt.shape[1]):
+            raise ValueError("Distance matrices must be square")
+            
+        if not np.allclose(self.Dopt, self.Dopt.T):
+            warnings.warn("Dopt is not symmetric")
+            
+        if not np.allclose(self.Dclr, self.Dclr.T):
+            warnings.warn("Dclr is not symmetric")
+    
+    def _compute_correlation(self, perm: np.ndarray) -> float:
+        """
+        Compute correlation between Dopt and permuted Dclr.
+        
+        Parameters:
+        -----------
+        perm : np.ndarray
+            Permutation indices
+            
+        Returns:
+        --------
+        float : correlation coefficient
+        """
+        # Apply permutation to both rows and columns
+        Dclr_perm = self.Dclr[np.ix_(perm, perm)]
+        
+        # Extract upper triangular parts (excluding diagonal)
+        mask = np.triu(np.ones_like(self.Dopt, dtype=bool), k=1)
+        dopt_vec = self.Dopt[mask]
+        dclr_vec = Dclr_perm[mask]
+        
+        if self.correlation_type == 'pearson':
+            corr, _ = pearsonr(dopt_vec, dclr_vec)
+        elif self.correlation_type == 'spearman':
+            corr, _ = spearmanr(dopt_vec, dclr_vec)
+        else:
+            raise ValueError("correlation_type must be 'pearson' or 'spearman'")
+            
+        return corr if not np.isnan(corr) else -1.0
+    
+    def hungarian_method(self) -> Dict:
+        """
+        Use Hungarian algorithm to minimize cost (maximize correlation).
+        Note: This treats the problem as a bipartite matching problem.
+        """
+        print("Running Hungarian algorithm...")
+        start_time = time.time()
+        
+        # Create cost matrix: cost = 1 - |correlation|
+        # We'll use a heuristic: for each pair of points, compute how well
+        # their distances to all other points correlate
+        cost_matrix = np.zeros((self.n, self.n))
+        
+        for i in range(self.n):
+            for j in range(self.n):
+                # Compare distances from point i in Dopt to distances from point j in Dclr
+                dopt_dists = self.Dopt[i, :]
+                dclr_dists = self.Dclr[j, :]
+                
+                if self.correlation_type == 'pearson':
+                    corr, _ = pearsonr(dopt_dists, dclr_dists)
+                else:
+                    corr, _ = spearmanr(dopt_dists, dclr_dists)
+                
+                cost_matrix[i, j] = 1 - abs(corr) if not np.isnan(corr) else 1.0
+        
+        # Solve assignment problem
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        
+        # Create permutation
+        perm = np.zeros(self.n, dtype=int)
+        perm[row_ind] = col_ind
+        
+        correlation = self._compute_correlation(perm)
+        runtime = time.time() - start_time
+        
+        result = {
+            'method': 'hungarian',
+            'permutation': perm,
+            'correlation': correlation,
+            'runtime': runtime,
+            'cost_matrix': cost_matrix
+        }
+        
+        self.results['hungarian'] = result
+        return result
+    
+    def simulated_annealing(self, max_iter: int = 10000, 
+                          initial_temp: float = 1.0,
+                          cooling_rate: float = 0.995) -> Dict:
+        """
+        Use simulated annealing to find optimal permutation.
+        """
+        print("Running simulated annealing...")
+        start_time = time.time()
+        
+        # Initialize with random permutation
+        current_perm = np.random.permutation(self.n)
+        current_corr = self._compute_correlation(current_perm)
+        
+        best_perm = current_perm.copy()
+        best_corr = current_corr
+        
+        temp = initial_temp
+        correlations = []
+        
+        for iteration in range(max_iter):
+            # Generate neighbor by swapping two random elements
+            new_perm = current_perm.copy()
+            i, j = np.random.choice(self.n, 2, replace=False)
+            new_perm[i], new_perm[j] = new_perm[j], new_perm[i]
+            
+            new_corr = self._compute_correlation(new_perm)
+            
+            # Accept or reject
+            delta = new_corr - current_corr
+            if delta > 0 or np.random.random() < np.exp(delta / temp):
+                current_perm = new_perm
+                current_corr = new_corr
+                
+                if current_corr > best_corr:
+                    best_perm = current_perm.copy()
+                    best_corr = current_corr
+            
+            correlations.append(current_corr)
+            temp *= cooling_rate
+            
+            if iteration % 1000 == 0:
+                print(f"  Iteration {iteration}: best_corr = {best_corr:.4f}, current_corr = {current_corr:.4f}")
+        
+        runtime = time.time() - start_time
+        
+        result = {
+            'method': 'simulated_annealing',
+            'permutation': best_perm,
+            'correlation': best_corr,
+            'runtime': runtime,
+            'correlations_history': correlations,
+            'parameters': {
+                'max_iter': max_iter,
+                'initial_temp': initial_temp,
+                'cooling_rate': cooling_rate
+            }
+        }
+        
+        self.results['simulated_annealing'] = result
+        return result
+    
+    def genetic_algorithm(self, population_size: int = 100, 
+                         generations: int = 500,
+                         mutation_rate: float = 0.1,
+                         crossover_rate: float = 0.8) -> Dict:
+        """
+        Use genetic algorithm to find optimal permutation.
+        """
+        print("Running genetic algorithm...")
+        start_time = time.time()
+        
+        # Initialize population
+        population = [np.random.permutation(self.n) for _ in range(population_size)]
+        
+        best_perm = None
+        best_corr = -np.inf
+        correlations = []
+        
+        for generation in range(generations):
+            # Evaluate fitness
+            fitness = [self._compute_correlation(perm) for perm in population]
+            
+            # Track best
+            gen_best_idx = np.argmax(fitness)
+            if fitness[gen_best_idx] > best_corr:
+                best_corr = fitness[gen_best_idx]
+                best_perm = population[gen_best_idx].copy()
+            
+            correlations.append(best_corr)
+            
+            # Selection (tournament selection)
+            new_population = []
+            for _ in range(population_size):
+                tournament_size = 3
+                tournament_indices = np.random.choice(population_size, tournament_size)
+                winner_idx = tournament_indices[np.argmax([fitness[i] for i in tournament_indices])]
+                new_population.append(population[winner_idx].copy())
+            
+            population = new_population
+            
+            # Crossover and mutation
+            for i in range(0, population_size-1, 2):
+                if np.random.random() < crossover_rate:
+                    # Order crossover (OX)
+                    parent1, parent2 = population[i], population[i+1]
+                    child1, child2 = self._order_crossover(parent1, parent2)
+                    population[i], population[i+1] = child1, child2
+                
+                # Mutation (swap mutation)
+                if np.random.random() < mutation_rate:
+                    perm = population[i]
+                    idx1, idx2 = np.random.choice(self.n, 2, replace=False)
+                    perm[idx1], perm[idx2] = perm[idx2], perm[idx1]
+                    
+                if np.random.random() < mutation_rate:
+                    perm = population[i+1]
+                    idx1, idx2 = np.random.choice(self.n, 2, replace=False)
+                    perm[idx1], perm[idx2] = perm[idx2], perm[idx1]
+            
+            if generation % 50 == 0:
+                print(f"  Generation {generation}: best_corr = {best_corr:.4f}")
+        
+        runtime = time.time() - start_time
+        
+        result = {
+            'method': 'genetic_algorithm',
+            'permutation': best_perm,
+            'correlation': best_corr,
+            'runtime': runtime,
+            'correlations_history': correlations,
+            'parameters': {
+                'population_size': population_size,
+                'generations': generations,
+                'mutation_rate': mutation_rate,
+                'crossover_rate': crossover_rate
+            }
+        }
+        
+        self.results['genetic_algorithm'] = result
+        return result
+    
+    def _order_crossover(self, parent1: np.ndarray, parent2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Order crossover for permutations."""
+        size = len(parent1)
+        start, end = sorted(np.random.choice(size, 2, replace=False))
+        
+        child1 = np.full(size, -1)
+        child2 = np.full(size, -1)
+        
+        # Copy segment
+        child1[start:end] = parent1[start:end]
+        child2[start:end] = parent2[start:end]
+        
+        # Fill remaining positions
+        self._fill_child(child1, parent2, start, end)
+        self._fill_child(child2, parent1, start, end)
+        
+        return child1, child2
+    
+    def _fill_child(self, child: np.ndarray, parent: np.ndarray, start: int, end: int):
+        """Helper for order crossover."""
+        size = len(child)
+        remaining = [x for x in parent if x not in child[start:end]]
+        
+        # Fill positions after end
+        pos = end
+        idx = 0
+        while pos < size and idx < len(remaining):
+            child[pos] = remaining[idx]
+            pos += 1
+            idx += 1
+        
+        # Fill positions before start
+        pos = 0
+        while pos < start and idx < len(remaining):
+            child[pos] = remaining[idx]
+            pos += 1
+            idx += 1
+    
+    def brute_force(self) -> Dict:
+        """
+        Brute force search (only feasible for small n).
+        """
+        if self.n > 8:
+            print(f"Brute force not feasible for n={self.n} (too large)")
+            return None
+            
+        print(f"Running brute force search for n={self.n}...")
+        start_time = time.time()
+        
+        best_perm = None
+        best_corr = -np.inf
+        
+        count = 0
+        for perm in itertools.permutations(range(self.n)):
+            perm = np.array(perm)
+            corr = self._compute_correlation(perm)
+            
+            if corr > best_corr:
+                best_corr = corr
+                best_perm = perm.copy()
+            
+            count += 1
+            if count % 1000 == 0:
+                print(f"  Evaluated {count} permutations, best_corr = {best_corr:.4f}")
+        
+        runtime = time.time() - start_time
+        
+        result = {
+            'method': 'brute_force',
+            'permutation': best_perm,
+            'correlation': best_corr,
+            'runtime': runtime,
+            'total_permutations': count
+        }
+        
+        self.results['brute_force'] = result
+        return result
+    
+    def greedy_heuristic(self) -> Dict:
+        """
+        Greedy heuristic: iteratively assign points to maximize correlation.
+        """
+        print("Running greedy heuristic...")
+        start_time = time.time()
+        
+        assigned_opt = set()
+        assigned_clr = set()
+        perm = np.full(self.n, -1)
+        
+        for step in range(self.n):
+            best_score = -np.inf
+            best_i, best_j = None, None
+            
+            for i in range(self.n):
+                if i in assigned_opt:
+                    continue
+                for j in range(self.n):
+                    if j in assigned_clr:
+                        continue
+                    
+                    # Score this assignment based on correlation with already assigned points
+                    score = 0
+                    count = 0
+                    for k in range(self.n):
+                        if perm[k] != -1:  # Already assigned
+                            # Add correlation between distances
+                            score += abs(self.Dopt[i, k] - self.Dclr[j, perm[k]])
+                            count += 1
+                    
+                    # Normalize score (we want to minimize distance differences)
+                    if count > 0:
+                        score = -score / count  # Negative because we want to minimize
+                    else:
+                        # For first assignment, use correlation of distance vectors
+                        dopt_dists = self.Dopt[i, :]
+                        dclr_dists = self.Dclr[j, :]
+                        if self.correlation_type == 'pearson':
+                            score, _ = pearsonr(dopt_dists, dclr_dists)
+                        else:
+                            score, _ = spearmanr(dopt_dists, dclr_dists)
+                        score = score if not np.isnan(score) else -1
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_i, best_j = i, j
+            
+            # Make assignment
+            perm[best_i] = best_j
+            assigned_opt.add(best_i)
+            assigned_clr.add(best_j)
+        
+        correlation = self._compute_correlation(perm)
+        runtime = time.time() - start_time
+        
+        result = {
+            'method': 'greedy_heuristic',
+            'permutation': perm,
+            'correlation': correlation,
+            'runtime': runtime
+        }
+        
+        self.results['greedy_heuristic'] = result
+        return result
+    
+    def run_all_methods(self, methods: Optional[List[str]] = None) -> Dict:
+        """
+        Run all available methods and compare results.
+        
+        Parameters:
+        -----------
+        methods : List[str], optional
+            List of methods to run. If None, runs all appropriate methods.
+        """
+        if methods is None:
+            methods = ['hungarian', 'greedy_heuristic', 'simulated_annealing']
+            if self.n <= 8:
+                methods.append('brute_force')
+            if self.n >= 10:  # GA works better for larger problems
+                methods.append('genetic_algorithm')
+        
+        print(f"Running optimization for {self.n}x{self.n} distance matrices")
+        print(f"Correlation type: {self.correlation_type}")
+        print(f"Methods to run: {methods}")
+        print("="*60)
+        
+        results = {}
+        
+        for method in methods:
+            try:
+                if method == 'hungarian':
+                    results[method] = self.hungarian_method()
+                elif method == 'simulated_annealing':
+                    results[method] = self.simulated_annealing()
+                elif method == 'genetic_algorithm':
+                    results[method] = self.genetic_algorithm()
+                elif method == 'brute_force':
+                    results[method] = self.brute_force()
+                elif method == 'greedy_heuristic':
+                    results[method] = self.greedy_heuristic()
+                else:
+                    print(f"Unknown method: {method}")
+                    continue
+                
+                print(f"{method}: correlation = {results[method]['correlation']:.4f}, "
+                      f"runtime = {results[method]['runtime']:.3f}s")
+                
+            except Exception as e:
+                print(f"Error running {method}: {e}")
+                
+        print("="*60)
+        
+        # Find best result
+        if results:
+            best_method = max(results.keys(), key=lambda k: results[k]['correlation'])
+            print(f"Best method: {best_method} (correlation = {results[best_method]['correlation']:.4f})")
+            
+        return results
+    
+    def visualize_results(self, save_fig: bool = False, filename: str = None):
+        """
+        Visualize the optimization results.
+        """
+        if not self.results:
+            print("No results to visualize. Run optimization first.")
+            return
+        
+        # Create subplots
+        n_methods = len(self.results)
+        fig, axes = plt.subplots(2, n_methods + 1, figsize=(4*(n_methods+1), 8))
+        
+        if n_methods == 1:
+            axes = axes.reshape(2, -1)
+        
+        # Plot original matrices
+        im1 = axes[0, 0].imshow(self.Dopt, cmap='viridis')
+        axes[0, 0].set_title('Original Dopt')
+        axes[0, 0].set_xlabel('Point index')
+        axes[0, 0].set_ylabel('Point index')
+        plt.colorbar(im1, ax=axes[0, 0])
+        
+        im2 = axes[1, 0].imshow(self.Dclr, cmap='viridis')
+        axes[1, 0].set_title('Original Dclr')
+        axes[1, 0].set_xlabel('Point index')
+        axes[1, 0].set_ylabel('Point index')
+        plt.colorbar(im2, ax=axes[1, 0])
+        
+        # Plot results for each method
+        for i, (method, result) in enumerate(self.results.items()):
+            perm = result['permutation']
+            Dclr_perm = self.Dclr[np.ix_(perm, perm)]
+            
+            im = axes[0, i+1].imshow(Dclr_perm, cmap='viridis')
+            axes[0, i+1].set_title(f'{method}\nCorr = {result["correlation"]:.3f}')
+            axes[0, i+1].set_xlabel('Point index')
+            axes[0, i+1].set_ylabel('Point index')
+            plt.colorbar(im, ax=axes[0, i+1])
+            
+            # Scatter plot of distances
+            mask = np.triu(np.ones_like(self.Dopt, dtype=bool), k=1)
+            dopt_vec = self.Dopt[mask]
+            dclr_vec = Dclr_perm[mask]
+            
+            axes[1, i+1].scatter(dopt_vec, dclr_vec, alpha=0.6)
+            axes[1, i+1].plot([dopt_vec.min(), dopt_vec.max()], 
+                             [dopt_vec.min(), dopt_vec.max()], 'r--', alpha=0.8)
+            axes[1, i+1].set_xlabel('Dopt distances')
+            axes[1, i+1].set_ylabel('Dclr distances (permuted)')
+            axes[1, i+1].set_title(f'Distance Correlation\nr = {result["correlation"]:.3f}')
+        
+        plt.tight_layout()
+        
+        if save_fig:
+            if filename is None:
+                filename = f'distance_matrix_optimization_results_{int(time.time())}.png'
+            plt.savefig(filename, dpi=150, bbox_inches='tight')
+            print(f"Figure saved as {filename}")
+        
+        plt.show()
+    
+    def get_best_result(self) -> Dict:
+        """Get the best result across all methods."""
+        if not self.results:
+            return None
+        
+        best_method = max(self.results.keys(), key=lambda k: self.results[k]['correlation'])
+        return self.results[best_method]
