@@ -28,7 +28,7 @@ from IPython.display import HTML
 
 import sys
 import time
-from .ConnectedComponentEntropy import ConnectedComponentEntropy
+
 
 def list_entropy(X):
         _, cnt = np.unique(X, return_counts=True)
