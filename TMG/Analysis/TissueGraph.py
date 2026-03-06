@@ -32,6 +32,7 @@ import pickle
 
 import re
 import igraph
+from collections import defaultdict
 
 
 from scipy.sparse.csgraph import dijkstra
@@ -710,7 +711,7 @@ class TissueMultiGraph:
         composition_taxonomy : Taxonomy, optional
             Taxonomy object for composition-based merging with upstream relationships
         Labels : array-like, optional
-            Custom labels for merging
+            Custom labels for merging - (danger) overrides section boundaries
 
         """
         if layer_type is None: 
@@ -728,11 +729,23 @@ class TissueMultiGraph:
 
         # Contract graph with appropriate feature calculation
         if composition_taxonomy is not None:
+
             # For composition layers, we'll set the feature matrix manually after contracting
+            # this works if Labels is None so it works by Type or by Labels if not None. 
             MergedLayer = self.Layers[base_layer_id].contract_graph(Labels=Labels, feature_mat_calc=None)
             
-            # Set the feature matrix to be the composition-based environments
-            composition_features = self.Layers[base_layer_id].extract_environments(typevec=Labels,N=len(composition_taxonomy.upstream_type))
+            if Labels is not None: 
+                # Set the feature matrix to be the composition-based environments
+                # based on the Labels vector
+                composition_features = self.Layers[base_layer_id].extract_environments(typevec=Labels,N=len(composition_taxonomy.upstream_type))
+            else: 
+                # This is the native solution, we didn't get external label and the merging determined the
+                # new units. We'll use their upstream to find the indexes where they match and calculate 
+                # the actual composition for each new entiry
+                Labels = MergedLayer.Upstream
+                self.update_current_type(base_layer_id,composition_taxonomy.upstream_tax)
+                composition_features = self.Layers[base_layer_id].extract_environments(typevec=Labels,N=len(composition_taxonomy.upstream_type))
+            # update feature_mat
             MergedLayer.feature_mat = composition_features
         else:
             # For regular layers, use default mean calculation
@@ -756,7 +769,6 @@ class TissueMultiGraph:
             
             # Set the merged layer to use the composition taxonomy
             self.layer_taxonomy_mapping[merged_layer_id] = comp_tax_id
-         
 
         else:
             # Default behavior: copy taxonomy mapping from base layer
@@ -832,7 +844,8 @@ class TissueMultiGraph:
         
         # Update the merged layer
         merged_layer.SG = merged_SG
-        merged_layer.adata.obsp["SG"] = merged_SG.get_adjacency_sparse()
+        merged_layer._spatial_edge_list = None
+        merged_layer.adata.obsp["SG"] = merged_SG.get_adjacency_sparse(attribute='weight')
         
         TMG.update_user(f"Created weighted spatial graph for layer {merged_layer_id} with "
                     f"{merged_SG.vcount()} nodes and {merged_SG.ecount()} edges")
