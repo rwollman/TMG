@@ -435,7 +435,6 @@ def merge_colormaps(colormap_names,clr_range = (0,1),res = 128):
     mymap = LinearSegmentedColormap.from_list('my_colormap', colors)
     return mymap
 
-<<<<<<< HEAD
 def hex_color_distance_matrix(hex_codes, de="1976"):
     """
     Compute deltaE distance matrix between hex color codes in CIELAB space.

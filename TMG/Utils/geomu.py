@@ -866,8 +866,15 @@ def merge_polygons_by_ids(polys,ids,max_buff = 0.01,dbuffer=0.001, smooth_telera
     all_merged_polys = list()
     for uid in unq_id:
         ix = np.flatnonzero(ids == uid)
-        poly_list = [polys[i] for i in ix]
-        for i,poly in enumerate(poly_list):
+        # Flatten any MultiPolygons from the base layer into individual Polygons
+        poly_list = []
+        for i in ix:
+            p = polys[i]
+            if isinstance(p, MultiPolygon):
+                poly_list.extend(p.geoms)
+            else:
+                poly_list.append(p)
+        for i, poly in enumerate(poly_list):
             if not poly.is_valid:
                 new_exterior = poly.exterior
                 new_holes = [hole for hole in poly.interiors if Polygon(new_exterior).contains(Polygon(hole))]
