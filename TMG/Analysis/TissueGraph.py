@@ -27,6 +27,7 @@ import datetime
 import os.path
 import json
 import tqdm
+import time
 
 import pickle
 
@@ -474,9 +475,20 @@ class TissueMultiGraph:
 
         if any(isinstance(item, str) for item in type_vec):
             type_vec = tax.get_type_ix(type_vec)
-            
+
+        # Before overwriting, ensure the current type data is saved under its canonical
+        # "{tax_name}_id" column so that update_current_type can find it later.
+        # This handles the case where the layer was originally saved with the default "Type" column.
+        current_tax_id = self.layer_taxonomy_mapping.get(layer_id)
+        if current_tax_id is not None:
+            current_tax_name = self.Taxonomies[current_tax_id].name
+            canonical_col = f"{current_tax_name}_id"
+            current_type = self.Layers[layer_id].Type
+            if current_type is not None and canonical_col not in self.Layers[layer_id].adata.obs.columns:
+                self.Layers[layer_id].adata.obs[canonical_col] = current_type
+
         # update Layer Type
-        self.update_current_type(layer_id,tax_id)  
+        self.update_current_type(layer_id,tax_id)
         self.Layers[layer_id].Type = type_vec
 
         return 
@@ -614,27 +626,6 @@ class TissueMultiGraph:
         else: 
             XY = np.array(adata.obs[["stage_x","stage_y"]])
         S = np.array(adata.obs[self.adata_mapping['Section']])
-
-        # """ Filter Out Non Cells Spatially""" #Parameterize
-        # self.update_user('Filtering Cells By Spatial Proximity')
-        # M = np.ones(adata.shape[0])==1
-        # for section in np.unique(S):
-        #     m = S==section
-        #     M[m] = geomu.in_graph_large_connected_components(XY[m,:],Section = None,max_dist = 0.05,large_comp_def = 0.1,plot_comp = False)
-        # adata.obs['in_large_comp'] = M#geomu.in_graph_large_connected_components(XY,Section = S,max_dist = 0.05,large_comp_def = 0,plot_comp = False)
-        # adata = adata[adata.obs['in_large_comp']==True].copy()
-        # self.update_user(f"{adata.shape[0]} cells across {adata.obs[self.adata_mapping['Section']].unique().shape[0]} sections")
-
-        # """ Filter Out Non Cells By Nuc Stain""" #Parameterize
-        # self.update_user('Filtering Cells By Nuc Stain')
-        # adata.layers['nuc_mask'] = basicu.filter_cells_nuc(adata)
-        # adata = adata[np.sum(adata.layers['nuc_mask']==False,axis=1)>0].copy() # Harshest possible filter get rid of any cells that are bad in any bit
-        # self.update_user(f"{adata.shape[0]} cells across {adata.obs[self.adata_mapping['Section']].unique().shape[0]} sections")
-
-        # """ Minimum Sum Filter """ #Parameterize
-        # self.update_user('Filtering Cells By Minimum Raw Sum')
-        # adata = adata[np.clip(np.array(adata.layers['raw']).copy().sum(1),1,None)>100].copy()
-        # self.update_user(f"{adata.shape[0]} cells across {adata.obs[self.adata_mapping['Section']].unique().shape[0]} sections")
 
         if register_to_ccf: 
             XY = np.array(adata.obs[["ccf_z","ccf_y"]])
@@ -851,6 +842,131 @@ class TissueMultiGraph:
                     f"{merged_SG.vcount()} nodes and {merged_SG.ecount()} edges")
         
         return merged_SG
+
+    def build_3d_region_graph(self, cell_layer_id=0, region_layer_id=1, grid_size=0.1, min_overlap_fraction=0.1):
+        """
+        Creates 3D Z-edges using binary pixel masks and sparse matrix multiplication.
+        Z-edges are created if the spatial overlap exceeds the min_overlap_fraction 
+        for AT LEAST ONE of the two interacting regions. No grid dilation.
+        
+        Parameters
+        ----------
+        grid_size : float, default 0.1
+            The size of the XY bins. Defaults to 0.1 (assumes coordinates are in mm).
+        min_overlap_fraction : float, default 0.1
+            The minimum fraction of a region's area that must overlap with the adjacent 
+            region to establish a 3D Z-edge (e.g., 0.1 = 10% overlap).
+        """
+        import numpy as np
+        from scipy.sparse import csr_matrix
+        import tqdm
+
+        cell_layer = self.Layers[cell_layer_id]
+        region_layer = self.Layers[region_layer_id]
+
+        if region_layer.Upstream is None or region_layer.SG is None:
+            raise ValueError("Region layer missing Upstream mapping or 2D SG.")
+
+        upstream_mapping = np.array(region_layer.Upstream)
+        sg_3d = region_layer.SG.copy()
+        
+        # Ensure 2D edges have baseline attributes
+        if 'is_z_edge' not in sg_3d.es.attributes():
+            sg_3d.es['is_z_edge'] = False
+        else:
+            sg_3d.es['is_z_edge'] = [z if z is not None else False for z in sg_3d.es['is_z_edge']]
+
+        if 'weight' not in sg_3d.es.attributes():
+            sg_3d.es['weight'] = 1.0 
+        else:
+            sg_3d.es['weight'] = [1.0 for _ in sg_3d.es['weight']]  # Force all to 1.0 to match
+
+        # We only need a set now, since edges are binary (weight = 1.0)
+        z_edges = set()
+        
+        # Shift coordinates to strictly positive space
+        x_min = cell_layer.XY[:, 0].min()
+        y_min = cell_layer.XY[:, 1].min()
+
+        nx = int(np.ceil((cell_layer.XY[:, 0].max() - x_min) / grid_size)) + 1
+        ny = int(np.ceil((cell_layer.XY[:, 1].max() - y_min) / grid_size)) + 1
+        n_pixels = nx * ny
+        n_regions = np.max(upstream_mapping) + 1
+
+        self.update_user(f"Rasterizing to {nx}x{ny} grid. Threshold: {min_overlap_fraction*100}% area...")
+
+        for i in tqdm.tqdm(range(self.Nsections - 1), desc="3D Z-Edges"):
+            sec_A = self.unqS[i]
+            sec_B = self.unqS[i+1]
+
+            idx_A = np.flatnonzero(cell_layer.Section == sec_A)
+            idx_B = np.flatnonzero(cell_layer.Section == sec_B)
+
+            if len(idx_A) == 0 or len(idx_B) == 0:
+                continue
+
+            px_A = ((cell_layer.XY[idx_A, 0] - x_min) // grid_size).astype(int)
+            py_A = ((cell_layer.XY[idx_A, 1] - y_min) // grid_size).astype(int)
+            pixel_1d_A = px_A * ny + py_A
+            reg_A = upstream_mapping[idx_A]
+
+            px_B = ((cell_layer.XY[idx_B, 0] - x_min) // grid_size).astype(int)
+            py_B = ((cell_layer.XY[idx_B, 1] - y_min) // grid_size).astype(int)
+            pixel_1d_B = px_B * ny + py_B
+            reg_B = upstream_mapping[idx_B]
+
+            Mask_A = csr_matrix((np.ones(len(idx_A)), (reg_A, pixel_1d_A)), shape=(n_regions, n_pixels))
+            Mask_B = csr_matrix((np.ones(len(idx_B)), (reg_B, pixel_1d_B)), shape=(n_regions, n_pixels))
+
+            # Binarize masks
+            Mask_A.data = np.ones_like(Mask_A.data)
+            Mask_B.data = np.ones_like(Mask_B.data)
+            
+            # Calculate total area (in pixels) for each region
+            area_A = np.asarray(Mask_A.sum(axis=1)).flatten()
+            area_B = np.asarray(Mask_B.sum(axis=1)).flatten()
+
+            # Matrix Multiplication for absolute overlap
+            Overlap = Mask_A.dot(Mask_B.T)
+
+            r1, r2 = Overlap.nonzero()
+            absolute_overlaps = Overlap.data
+
+            # Apply fractional threshold
+            for reg1, reg2, overlap_px in zip(r1, r2, absolute_overlaps):
+                if area_A[reg1] == 0 or area_B[reg2] == 0:
+                    continue
+                    
+                # Calculate fraction of Region A and Region B that this overlap represents
+                frac_A = overlap_px / area_A[reg1]
+                frac_B = overlap_px / area_B[reg2]
+                
+                # If the overlap is significant for AT LEAST ONE of the regions, it's an edge
+                if max(frac_A, frac_B) >= min_overlap_fraction:
+                    edge = tuple(sorted([reg1, reg2]))
+                    z_edges.add(edge)
+
+        if not z_edges:
+            self.update_user("No overlapping 3D regions passed threshold. Returning 2D graph copy.")
+            region_layer.adata.obsp["SG3D"] = sg_3d.get_adjacency_sparse(attribute='weight')
+            return sg_3d
+
+        # Add the new binary Z-edges to the graph
+        new_edges = list(z_edges)
+        new_weights = [1.0] * len(new_edges)
+
+        start_e_idx = sg_3d.ecount()
+        sg_3d.add_edges(new_edges)
+        end_e_idx = sg_3d.ecount()
+
+        sg_3d.es[start_e_idx:end_e_idx]['weight'] = new_weights
+        sg_3d.es[start_e_idx:end_e_idx]['is_z_edge'] = True
+
+        region_layer.SG3D = sg_3d 
+        region_layer.adata.obsp["SG3D"] = sg_3d.get_adjacency_sparse(attribute='weight')
+
+        self.update_user(f"Successfully created SG3D: added {len(new_edges)} unweighted Z-edges.")
+        return sg_3d
 
     
     def find_upstream_layer(self, layer_id):
