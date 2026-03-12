@@ -102,6 +102,21 @@ def _xyz_to_rgb(xyz):
     
     return np.clip(rgb, 0, 1)
 
+def rgb_array_to_hex(rgb_list):
+    # Ensure input is a list of lists or numpy array
+    hex_list = []
+    for rgb in rgb_list:
+        # Handle np arrays or tuples, scale if 0-1, and clamp
+        vals = np.array(rgb)
+        if vals.max() <= 1.01:  # Assume 0-1 range
+            vals = np.clip(vals, 0, 1)
+            vals = (vals * 255).round().astype(int)
+        else:  # Already 0-255
+            vals = np.clip(vals, 0, 255).astype(int)
+        hex_str = '#{:02X}{:02X}{:02X}'.format(vals[0], vals[1], vals[2])
+        hex_list.append(hex_str)
+    return hex_list
+
 def rgb_to_lab(rgb):
     """Convert RGB to LAB color space"""
     xyz = _rgb_to_xyz(rgb)
