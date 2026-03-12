@@ -265,6 +265,11 @@ def merge_nested_clusters(GPmat, top_down = True):
 
     Ncells_vec = np.array([GPmat[i,0].N for i in range(GPmat.shape[0])])
     Ncells = Ncells_vec.sum()
+    sample_gp = GPmat[0,0]
+    score_x = np.asarray(sample_gp.pbond_vec, dtype=float)
+    n_score_points = sample_gp.ent_type_real.shape[0]
+    score_x = score_x[:n_score_points]
+
     # create the type matrix from GP objects: 
     type_vecs=list()
     for row in GPmat: 
@@ -279,7 +284,7 @@ def merge_nested_clusters(GPmat, top_down = True):
     type_freq_lvl = [None] * GPmat.shape[1]
 
     for lvl in range(len(delta_ent_per_pbond_type_lvl)):
-        delta_ent_per_pbond_type_lvl[lvl] = np.zeros((Ntypes_per_lvl[lvl],GPmat.shape[0],len(GPmat[0,0].pbond_vec)))
+        delta_ent_per_pbond_type_lvl[lvl] = np.zeros((Ntypes_per_lvl[lvl],GPmat.shape[0],n_score_points))
         type_freq_lvl[lvl] = np.zeros((Ntypes_per_lvl[lvl],GPmat.shape[0]))
 
     # extract the actual values
@@ -288,8 +293,8 @@ def merge_nested_clusters(GPmat, top_down = True):
             types_in_section,type_freq = np.unique(GPmat[sec,lvl].type_vec,return_counts=True)
             type_freq_lvl[lvl][types_in_section.astype(int),sec] = type_freq/Ncells
             dent = np.abs(GPmat[sec,lvl].ent_type_perm.T-GPmat[sec,lvl].ent_type_real.T)
-            dent /= np.log2(GPmat[sec,lvl].N) 
-            delta_ent_per_pbond_type_lvl[lvl][types_in_section.astype(int),sec,:] = dent
+            # dent /= np.log2(GPmat[sec,lvl].N) 
+            delta_ent_per_pbond_type_lvl[lvl][types_in_section.astype(int),sec,:] = dent[:, :n_score_points]
 
 
     # update the type numbers (so they are continous and not restaring each lebvel)
@@ -303,12 +308,13 @@ def merge_nested_clusters(GPmat, top_down = True):
     cmsm_type_freq = np.concatenate(type_freq_lvl,axis=0)
 
     # Pre-compute type contributions for optimization
-    def precompute_type_contributions(delta_ent_per_pbond, cmsm_type_freq):
-        """Pre-compute the score contribution of each type (summed over sections, per bond)"""
+    def precompute_type_contributions(delta_ent_per_pbond, cmsm_type_freq, score_x):
+        """Pre-compute each type contribution curve and its integrated score."""
         print("Computing type contributions...")
         n_types = delta_ent_per_pbond.shape[0]
         n_bonds = delta_ent_per_pbond.shape[2]
         contributions = np.zeros((n_types, n_bonds))
+        integrated_contributions = np.zeros(n_types)
         
         for i in range(n_types):
             if i % 1000 == 0:
@@ -317,23 +323,22 @@ def merge_nested_clusters(GPmat, top_down = True):
             dent = delta_ent_per_pbond[i,:,:]      # shape: (sections, bonds)
             # Sum over sections to get contribution per bond for this type
             contributions[i, :] = (dent * freq).sum(axis=0)  # shape: (bonds,)
+            integrated_contributions[i] = np.trapz(contributions[i, :], x=score_x)
         
-        return contributions
+        return contributions, integrated_contributions
 
     def score(curr_ix):
-        """Original slow score function - kept for top_down case"""
+        """Score with the same integration rule used by GraphPercolation."""
         dent_by_type_by_section_for_curr_types = delta_ent_per_pbond[curr_ix,:,:]
         freq_by_type_by_section_for_curr_types = cmsm_type_freq[curr_ix,:,np.newaxis]
         dent_by_section_summed_over_types = (dent_by_type_by_section_for_curr_types * freq_by_type_by_section_for_curr_types).sum(axis=0)
         dent_by_pbond = dent_by_section_summed_over_types.sum(axis=0)
-        scr = dent_by_pbond.mean()
+        scr = np.trapz(dent_by_pbond, x=score_x)
         return scr
     
-    def fast_score(curr_ix_list, type_contributions_per_bond):
-        """Fast score calculation using pre-computed contributions"""
-        # Sum contributions over selected types, then take mean over bonds
-        total_per_bond = type_contributions_per_bond[curr_ix_list, :].sum(axis=0)
-        return total_per_bond.mean()
+    def fast_score(curr_ix_list, type_contribution_scores):
+        """Fast score calculation using pre-computed integrated contributions."""
+        return type_contribution_scores[curr_ix_list].sum()
 
     # now create the mapping dict so that each type (key) has the list of subtype under it (values)
     # Initialize an empty dictionary
@@ -363,10 +368,14 @@ def merge_nested_clusters(GPmat, top_down = True):
         print("*** OPTIMIZED TOP-DOWN ALGORITHM ***")
         
         # Pre-compute all type contributions once (major optimization!)
-        type_contributions_per_bond = precompute_type_contributions(delta_ent_per_pbond, cmsm_type_freq)
+        type_contributions_per_bond, type_contribution_scores = precompute_type_contributions(
+            delta_ent_per_pbond,
+            cmsm_type_freq,
+            score_x,
+        )
         
         curr_ix_set = set(curr_ix)
-        current_score = fast_score(curr_ix, type_contributions_per_bond)
+        current_score = fast_score(curr_ix, type_contribution_scores)
         iteration_count = 0
         
         print(f"Initial curr_ix size: {len(curr_ix)}, initial score: {current_score:.6f}")
@@ -381,17 +390,18 @@ def merge_nested_clusters(GPmat, top_down = True):
             
             for i in range(len(curr_ix)):
                 if curr_ix[i] in adj_dict:
-                    subtypes = adj_dict[curr_ix[i]]
+                    parent_type = curr_ix[i]
+                    subtypes = adj_dict[parent_type]
                     
-                    # Calculate score change incrementally (MUCH faster!)
-                    old_contribution_per_bond = type_contributions_per_bond[curr_ix[i], :]
-                    new_contribution_per_bond = type_contributions_per_bond[subtypes, :].sum(axis=0)
-                    score_change = (new_contribution_per_bond - old_contribution_per_bond).mean()
+                    # Calculate score change incrementally using integrated contributions
+                    old_contribution_score = type_contribution_scores[parent_type]
+                    new_contribution_score = type_contribution_scores[subtypes].sum()
+                    score_change = new_contribution_score - old_contribution_score
                     new_score = current_score + score_change
                     
                     if new_score > current_score:
                         # Update curr_ix and curr_ix_set efficiently
-                        curr_ix_set.remove(curr_ix[i])
+                        curr_ix_set.remove(parent_type)
                         curr_ix = curr_ix[:i] + curr_ix[i+1:] + subtypes
                         curr_ix_set.update(subtypes)
                         current_score = new_score
@@ -399,7 +409,7 @@ def merge_nested_clusters(GPmat, top_down = True):
                         improvements_this_round += 1
                         
                         # Report improvement
-                        print(f"    Improvement #{improvements_this_round}: replaced {len([curr_ix[i]])} with {len(subtypes)} types, "
+                        print(f"    Improvement #{improvements_this_round}: replaced 1 with {len(subtypes)} types, "
                               f"score: {current_score:.6f}, curr_ix size: {len(curr_ix)}")
                         break  # Start over since curr_ix changed
             
@@ -421,11 +431,15 @@ def merge_nested_clusters(GPmat, top_down = True):
         print("*** OPTIMIZED BOTTOM-UP ALGORITHM ***")
         
         # Pre-compute all type contributions once (major optimization!)
-        type_contributions_per_bond = precompute_type_contributions(delta_ent_per_pbond, cmsm_type_freq)
+        type_contributions_per_bond, type_contribution_scores = precompute_type_contributions(
+            delta_ent_per_pbond,
+            cmsm_type_freq,
+            score_x,
+        )
         
         keys_per_level = [np.unique(cmsm_type_mat[:, lvl]) for lvl in range(4)]
         curr_ix_set = set(curr_ix)
-        current_score = fast_score(curr_ix, type_contributions_per_bond)
+        current_score = fast_score(curr_ix, type_contribution_scores)
         
         print(f"Initial curr_ix size: {len(curr_ix)}, initial score: {current_score:.6f}")
         print(f"Keys per level: {[len(keys) for keys in keys_per_level]}")
@@ -454,10 +468,10 @@ def merge_nested_clusters(GPmat, top_down = True):
                 if all(subtype in curr_ix_set for subtype in subtypes):
                     keys_with_valid_subtypes += 1
                     
-                    # Calculate score change incrementally (MUCH faster than recalculating everything!)
-                    old_contribution_per_bond = type_contributions_per_bond[subtypes, :].sum(axis=0)  # sum over subtypes
-                    new_contribution_per_bond = type_contributions_per_bond[key, :]
-                    score_change = (new_contribution_per_bond - old_contribution_per_bond).mean()
+                    # Calculate score change incrementally using integrated contributions
+                    old_contribution_score = type_contribution_scores[subtypes].sum()
+                    new_contribution_score = type_contribution_scores[key]
+                    score_change = new_contribution_score - old_contribution_score
                     new_score = current_score + score_change
                     
                     if new_score > current_score:
