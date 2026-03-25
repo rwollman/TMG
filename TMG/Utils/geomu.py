@@ -449,6 +449,7 @@ def plot_polygon_collection(verts_or_polys,
                             ylm = None,
                             zlm = None, 
                             alpha = 1,
+                            antialiaseds = True,
                             background_color = (1,1,1), # defaults to white background
                             transpose = False,
                             rotation = None,
@@ -522,8 +523,16 @@ def plot_polygon_collection(verts_or_polys,
     # verify rgb inputs and deal with cases where we only want edges
     assert rgb_faces is not None,"To plot provide RGB array (nx3)"
 
-    # Create the PolyCollection from vertices and set face/edge colors
-    p = PolyCollection(verts, facecolors=rgb_faces, edgecolors = 'none',alpha=alpha)
+    # If rgb_faces already carries per-face alpha (Nx4), let those values
+    # drive transparency; a scalar alpha would override them, so skip it.
+    _alpha = None if (np.asarray(rgb_faces).shape[-1] == 4) else alpha
+    p = PolyCollection(
+        verts,
+        facecolors=rgb_faces,
+        edgecolors='none',
+        alpha=_alpha,
+        antialiaseds=antialiaseds,
+    )
 
     if ax is None: 
         fig = plt.figure(figsize = (8,10))
@@ -1003,5 +1012,3 @@ def calculate_xy_limits(XY, margin_fraction=0.05):
     ylim = np.array([y_min - y_margin, y_max + y_margin])
     
     return xlim, ylim
-
-
