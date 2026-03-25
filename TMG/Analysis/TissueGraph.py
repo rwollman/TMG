@@ -739,6 +739,17 @@ class TissueMultiGraph:
         if tax_name is not None: 
             self.update_current_type(base_layer_id,tax_name)
 
+        original_base_tax_id = self.layer_taxonomy_mapping.get(base_layer_id)
+        if composition_taxonomy is not None and Labels is None and original_base_tax_id is not None:
+            current_tax_name = self.Taxonomies[original_base_tax_id].name
+            if tax_name is None and current_tax_name != composition_taxonomy.name:
+                self.update_user(
+                    f"create_merged_layer is contracting layer {base_layer_id} using its current taxonomy "
+                    f"'{current_tax_name}'. If you intended '{composition_taxonomy.name}', update the base "
+                    "layer type first or pass tax_name explicitly.",
+                    level=30,
+                )
+
         # Contract graph with appropriate feature calculation
         if composition_taxonomy is not None:
 
@@ -755,8 +766,15 @@ class TissueMultiGraph:
                 # new units. We'll use their upstream to find the indexes where they match and calculate 
                 # the actual composition for each new entiry
                 Labels = MergedLayer.Upstream
-                self.update_current_type(base_layer_id,composition_taxonomy.upstream_tax)
-                composition_features = self.Layers[base_layer_id].extract_environments(typevec=Labels,N=len(composition_taxonomy.upstream_type))
+                try:
+                    self.update_current_type(base_layer_id,composition_taxonomy.upstream_tax)
+                    composition_features = self.Layers[base_layer_id].extract_environments(
+                        typevec=Labels,
+                        N=len(composition_taxonomy.upstream_type),
+                    )
+                finally:
+                    if original_base_tax_id is not None:
+                        self.update_current_type(base_layer_id, original_base_tax_id)
             # update feature_mat
             MergedLayer.feature_mat = composition_features
         else:
@@ -785,8 +803,15 @@ class TissueMultiGraph:
         else:
             # Default behavior: copy taxonomy mapping from base layer
             self.layer_taxonomy_mapping[merged_layer_id] = self.layer_taxonomy_mapping[base_layer_id]
+
+        merged_tax_name = self.Taxonomies[self.layer_taxonomy_mapping[merged_layer_id]].name
+        merged_canonical_col = f"{merged_tax_name}_id"
+        if MergedLayer.Type is not None and merged_canonical_col not in MergedLayer.adata.obs.columns:
+            MergedLayer.adata.obs[merged_canonical_col] = MergedLayer.Type
+        MergedLayer.adata_mapping["Type"] = merged_canonical_col
         
         # Update layers graph
+        self.layers_graph = [edge for edge in self.layers_graph if edge[1] != merged_layer_id]
         self.layers_graph.append((base_layer_id,merged_layer_id))
 
     def build_merged_layer_SG(TMG, merged_layer_id=1, base_layer_id=0):
