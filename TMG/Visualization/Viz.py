@@ -187,7 +187,7 @@ class MultiSectionMapView(View):
     Each section gets its own subplot showing the specified map type.
     """
     def __init__(self, TMG, sections=None, level_type="cell", map_type="type", 
-                 figsize='infer', n_columns=4, facecolor='white', **kwargs):
+                 figsize='infer', n_columns=4, facecolor='white', show_titles=True, **kwargs):
         """
         Create a multi-section map view.
 
@@ -207,6 +207,8 @@ class MultiSectionMapView(View):
             The number of columns in the plot grid.
         facecolor : str, default 'white'
             The face color of the figure.
+        show_titles : bool, default True
+            Whether to label each panel with its section name.
         **kwargs : dict
             Additional keyword arguments passed to the individual map panels.
         """
@@ -221,6 +223,7 @@ class MultiSectionMapView(View):
         self.map_type = map_type
         self.n_columns = n_columns
         self.n_rows = math.ceil(len(sections) / n_columns)
+        self.show_titles = show_titles
         self.kwargs = kwargs
         
         # Calculate figure size
@@ -267,7 +270,8 @@ class MultiSectionMapView(View):
             if panel.ax is not None:
                 panel.ax.set_xticks([])
                 panel.ax.set_yticks([])
-                panel.ax.set_title(panel.name.split('_')[0], fontsize=8)  # Use section name as title
+                if self.show_titles:
+                    panel.ax.set_title(panel.name.split('_')[0], fontsize=8)  # Use section name as title
 
 class SingleMapView(View):
     """
@@ -884,6 +888,7 @@ class Map(Panel):
         self.ylim = kwargs.get('ylim',V.lims['y'])
         self.rotation = kwargs.get('rotation',None)
         self.axis_off = kwargs.get('axis_off', True)  # Default to axis off
+        self.antialiaseds = kwargs.get('antialiaseds', True)
 
         # get the geom collection saved in appropriate TMG Geom
         self.geom_collection = self.V.TMG.Geoms[section_ix][geom_type].verts
@@ -910,7 +915,8 @@ class Map(Panel):
                                           ax = self.ax,
                                           xlm = self.xlim,ylm = self.ylim,
                                           rotation = self.rotation,
-                                          axis_off = self.axis_off)
+                                          axis_off = self.axis_off,
+                                          antialiaseds = self.antialiaseds)
         
 
 class TypeMap(Map):
@@ -1833,5 +1839,3 @@ class CompositionLegend(Panel):
 
         
         print(f"✓ Created {n_compositions} pie charts filling the full panel space")
-
-
