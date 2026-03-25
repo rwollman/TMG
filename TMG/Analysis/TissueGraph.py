@@ -237,11 +237,22 @@ class TissueMultiGraph:
         
         LayerNameList = self._config["layer_types"]
         self.Layers = [None]*len(LayerNameList)
-        for i in range(len(LayerNameList)): 
+        for i in range(len(LayerNameList)):
             self.Layers[i] = TissueGraph(basepath = self.basepath,
-                                            layer_type = LayerNameList[i], 
+                                            layer_type = LayerNameList[i],
                                             redo = False)
-            
+
+        # Sync each layer's adata_mapping["Type"] with the stored layer_taxonomy_mapping.
+        # Layers created by contract_graph store type data under the default "Type" column;
+        # ensure the canonical "{tax_name}_id" column exists so update_current_type() works.
+        for i, layer in enumerate(self.Layers):
+            if i in self.layer_taxonomy_mapping:
+                tax_name = self.Taxonomies[self.layer_taxonomy_mapping[i]].name
+                canonical_col = f"{tax_name}_id"
+                if canonical_col not in layer.adata.obs.columns and "Type" in layer.adata.obs.columns:
+                    layer.adata.obs[canonical_col] = layer.adata.obs["Type"]
+                layer.adata_mapping["Type"] = canonical_col
+
         self.layers_graph = self._config["layers_graph"]
         self.geom_to_layer_type_mapping = self._config["geom_to_layer_type_mapping"]
         self.layer_to_geom_type_mapping = self._config["layer_to_geom_type_mapping"]
@@ -436,10 +447,20 @@ class TissueMultiGraph:
                 tax_id = all_tax_names.index(tax_id)
             except ValueError:
                 raise ValueError(f"Taxonomy '{tax_id}' not found in available taxonomies.")
-            
+
+        # Preserve the currently active type vector under its canonical taxonomy
+        # column before switching adata_mapping["Type"] to a different taxonomy.
+        current_tax_id = self.layer_taxonomy_mapping.get(layer_id)
+        if current_tax_id is not None:
+            current_tax_name = self.Taxonomies[current_tax_id].name
+            canonical_col = f"{current_tax_name}_id"
+            current_type = self.Layers[layer_id].Type
+            if current_type is not None and canonical_col not in self.Layers[layer_id].adata.obs.columns:
+                self.Layers[layer_id].adata.obs[canonical_col] = current_type
+
         self.layer_taxonomy_mapping[layer_id] = tax_id
         self.Layers[layer_id].adata_mapping["Type"] = f"{self.Taxonomies[tax_id].name}_id"
-    
+
     def add_type_information(self, layer_id, type_vec, tax): 
         """Adds type information to TMG
         
