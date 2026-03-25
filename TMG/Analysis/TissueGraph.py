@@ -2927,6 +2927,10 @@ class Taxonomy:
         self.adata.obs['RGB'] = rgb_codes
 
     def get_type_ix(self,typ_str):
+        if isinstance(typ_str, str):
+            typ_str = [typ_str]
+        else:
+            typ_str = list(typ_str)
         Type_ix_dict = {item: i for i, item in enumerate(self.Type)}
         index_positions = [Type_ix_dict.get(item) for item in typ_str]
         if any(pos is None for pos in index_positions):
