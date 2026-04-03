@@ -658,6 +658,64 @@ def greedy_color_assignment(
     
     return final_assignments
 
+def assign_colors_based_on_contact_matrix(contact_matrix: np.ndarray, abundances: np.ndarray, glasbey_colors: list) -> list:
+    """
+    Graph-walk color assignment exploiting the Glasbey palette structure.
+
+    Starts at the most-connected type, then walks to adjacent neighbors
+    (highest contact to the already-colored set) before jumping globally.
+    This ensures spatially proximal types receive maximally distinct colors.
+
+    Parameters:
+    - contact_matrix: np.ndarray (N x N), pairwise contact counts.
+    - abundances:     np.ndarray (N,), cell counts per type.
+    - glasbey_colors: list of N colors ordered so successive entries are
+                      maximally different from all previous entries.
+
+    Returns:
+    - list: Assigned colors, indexed by type.
+    """
+    N = len(abundances)
+    assigned_colors = [None] * N
+    colored_mask = np.zeros(N, dtype=bool)
+
+    working_matrix = contact_matrix.copy().astype(float)
+    np.fill_diagonal(working_matrix, 0)
+
+    # Pre-compute total connectivity for each node (used for seed + fallback)
+    total_contact = working_matrix.sum(axis=1)
+
+    # --- Seed: most connected node ---
+    best_node = int(np.argmax(total_contact))
+    assigned_colors[best_node] = glasbey_colors[0]
+    colored_mask[best_node] = True
+
+    for color_idx in range(1, N):
+        uncolored_idx = np.where(~colored_mask)[0]
+
+        # Contact of each uncolored node to the entire colored set
+        contact_to_colored = working_matrix[np.ix_(uncolored_idx, np.where(colored_mask)[0])].sum(axis=1)
+
+        adjacent_mask = contact_to_colored > 0
+
+        if adjacent_mask.any():
+            # Walk: pick the adjacent node with the most contact to colored set
+            adj_contacts = contact_to_colored[adjacent_mask]
+            adj_indices  = uncolored_idx[adjacent_mask]
+            max_c = adj_contacts.max()
+            candidates = adj_indices[adj_contacts == max_c]
+        else:
+            # Jump: no neighbors — pick the globally most-connected uncolored node
+            tc = total_contact[uncolored_idx]
+            max_c = tc.max()
+            candidates = uncolored_idx[tc == max_c]
+
+        # Tie-break by abundance
+        best_node = int(candidates[np.argmax(abundances[candidates])])
+        assigned_colors[best_node] = glasbey_colors[color_idx]
+        colored_mask[best_node] = True
+
+    return assigned_colors
 
 class DistanceMatrixOptimizer:
     """
