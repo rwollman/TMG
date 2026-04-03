@@ -26,6 +26,7 @@ import logging
 import datetime
 import os.path
 import json
+import sys
 import tqdm
 import time
 
@@ -75,6 +76,89 @@ def create_and_save_merged_geoms(sec, polys, ids, basepath,geom_type):
     merged_geom.save()
 
     return merged_geom
+
+
+def _import_graph_percolation_classes():
+    """Import GraphPercolation with a local-repo fallback for development use."""
+    try:
+        from max_info_atlases.percolation.graph_percolation import GraphPercolation, EdgeListManager
+        return GraphPercolation, EdgeListManager
+    except ImportError:
+        repo_src = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "..", "max_info_atlas", "src")
+        )
+        if repo_src not in sys.path:
+            sys.path.insert(0, repo_src)
+        from max_info_atlases.percolation.graph_percolation import GraphPercolation, EdgeListManager
+        return GraphPercolation, EdgeListManager
+
+
+def _run_section_percolation_job(args):
+    """Run percolation for a single section and persist the outputs."""
+    (
+        section,
+        xy,
+        type_vec,
+        output_pth,
+        maxK,
+        pbond_vec,
+        compute_type_entropy,
+        cache_edge_lists,
+    ) = args
+
+    try:
+        GraphPercolation, EdgeListManager = _import_graph_percolation_classes()
+
+        xy = np.asarray(xy)
+        type_vec = np.asarray(type_vec)
+        output_pth = os.fspath(output_pth)
+        os.makedirs(output_pth, exist_ok=True)
+
+        gp = GraphPercolation(XY=xy, type_vec=type_vec, maxK=maxK, pbond_vec=pbond_vec)
+
+        percolation_kwargs = {"compute_type_entropy": compute_type_entropy}
+        if cache_edge_lists:
+            edge_list_dir = os.path.join(output_pth, "edge_lists")
+            os.makedirs(edge_list_dir, exist_ok=True)
+            percolation_kwargs["edge_list_manager"] = EdgeListManager(base_dir=edge_list_dir)
+            percolation_kwargs["xy_name"] = str(section)
+
+        gp.percolation(**percolation_kwargs)
+
+        output_file = os.path.join(output_pth, f"{section}.npz")
+        score_file = os.path.join(output_pth, f"{section}.score")
+
+        gp.save(output_file)
+
+        raw_score = gp.raw_score()
+        normalized_score = np.nan
+        if gp.N > 1:
+            normalized_score = gp.normalized_score()
+
+        with open(score_file, "w", encoding="utf-8") as fh:
+            fh.write(f"{raw_score}\t{normalized_score}\n")
+
+        return {
+            "section": section,
+            "n_cells": int(len(type_vec)),
+            "output_file": output_file,
+            "score_file": score_file,
+            "raw_score": float(raw_score),
+            "normalized_score": float(normalized_score),
+            "status": "ok",
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "section": section,
+            "n_cells": int(len(type_vec)),
+            "output_file": None,
+            "score_file": None,
+            "raw_score": np.nan,
+            "normalized_score": np.nan,
+            "status": "error",
+            "error": str(exc),
+        }
 
 class TissueMultiGraph: 
     """Main class used to manage the creation of multi-layer graph representation of tissues. 
@@ -2068,6 +2152,164 @@ class TissueGraph:
             return self.N
         else: 
             return np.sum(self.Section==section)
+
+    def run_percolation(
+        self,
+        label_vec=None,
+        output_pth=None,
+        maxK=100,
+        pbond_vec=None,
+        compute_type_entropy=False,
+        n_jobs=None,
+        cache_edge_lists=True,
+        redo=False,
+    ):
+        """
+        Run graph percolation independently for each section and save the results.
+
+        Parameters
+        ----------
+        label_vec : array-like or str, optional
+            Labels to use for percolation. If None, uses ``self.Type``. If a string,
+            it is interpreted as an ``adata.obs`` column name or a key in
+            ``self.adata_mapping``.
+        output_pth : str
+            Directory where one ``.npz`` and one ``.score`` file per section are saved.
+        maxK : int, optional
+            Maximum k for GraphPercolation, defaults to 100.
+        pbond_vec : np.ndarray, optional
+            Optional percolation probability vector passed to GraphPercolation.
+        compute_type_entropy : bool, optional
+            Whether to also persist per-type entropy curves.
+        n_jobs : int, optional
+            Number of worker processes. Defaults to one process per available core,
+            capped by the number of sections.
+        cache_edge_lists : bool, optional
+            Whether to cache section edge lists under ``output_pth/edge_lists``.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Summary table with one row per processed section.
+        """
+        if output_pth is None:
+            raise ValueError("output_pth must be provided")
+
+        if label_vec is None:
+            labels = self.Type
+        elif isinstance(label_vec, str):
+            if label_vec in self.adata.obs.columns:
+                labels = np.asarray(self.adata.obs[label_vec])
+            elif (
+                label_vec in self.adata_mapping and
+                self.adata_mapping[label_vec] in self.adata.obs.columns
+            ):
+                labels = np.asarray(self.adata.obs[self.adata_mapping[label_vec]])
+            else:
+                raise ValueError(f"Could not resolve label_vec='{label_vec}' from adata.obs")
+        else:
+            labels = np.asarray(label_vec)
+
+        if labels is None:
+            raise ValueError("No labels available for percolation. Provide label_vec or populate .Type")
+
+        labels = np.asarray(labels).reshape(-1)
+        if len(labels) != self.N:
+            raise ValueError(
+                f"Label vector length ({len(labels)}) must match TissueGraph size ({self.N})"
+            )
+
+        pbond_vec = None if pbond_vec is None else np.asarray(pbond_vec)
+        output_pth = os.fspath(output_pth)
+        os.makedirs(output_pth, exist_ok=True)
+
+        sections = np.asarray(self.unqS)
+        if len(sections) == 0:
+            raise ValueError("No sections found in TissueGraph")
+
+        xy_all = self.XY
+        section_all = np.asarray(self.Section)
+        jobs = []
+        cached_results = []
+        for section in sections:
+            output_file = os.path.join(output_pth, f"{section}.npz")
+            score_file = os.path.join(output_pth, f"{section}.score")
+            if not redo and os.path.isfile(output_file) and os.path.isfile(score_file):
+                try:
+                    with open(score_file, "r", encoding="utf-8") as fh:
+                        raw_score, normalized_score = [float(v) for v in fh.read().split()]
+                except Exception:
+                    raw_score, normalized_score = float("nan"), float("nan")
+                section_mask = section_all == section
+                cached_results.append({
+                    "section": section,
+                    "n_cells": int(section_mask.sum()),
+                    "output_file": output_file,
+                    "score_file": score_file,
+                    "raw_score": raw_score,
+                    "normalized_score": normalized_score,
+                    "status": "cached",
+                    "error": None,
+                })
+                continue
+            section_mask = section_all == section
+            jobs.append(
+                (
+                    section,
+                    xy_all[section_mask, :],
+                    labels[section_mask],
+                    output_pth,
+                    maxK,
+                    pbond_vec,
+                    compute_type_entropy,
+                    cache_edge_lists,
+                )
+            )
+
+        if cached_results:
+            self.update_user(
+                f"Skipping {len(cached_results)} section(s) — GP and score files already exist."
+            )
+
+        if not jobs:
+            self.update_user("All sections already processed; returning cached results.")
+            results = cached_results
+        else:
+            if n_jobs is None:
+                n_jobs = multiprocessing.cpu_count()
+            n_jobs = max(1, min(int(n_jobs), len(jobs)))
+
+            self.update_user(
+                f"Running percolation for {len(jobs)} sections with {n_jobs} worker(s). "
+                f"Results will be saved under {output_pth}"
+            )
+
+            if n_jobs == 1:
+                new_results = [_run_section_percolation_job(job) for job in jobs]
+            else:
+                with multiprocessing.Pool(processes=n_jobs) as pool:
+                    new_results = list(
+                        tqdm.tqdm(
+                            pool.imap_unordered(_run_section_percolation_job, jobs),
+                            total=len(jobs),
+                            desc="Percolation",
+                        )
+                    )
+            results = cached_results + new_results
+
+        results_df = pd.DataFrame(results).sort_values("section").reset_index(drop=True)
+        n_errors = int((results_df["status"] == "error").sum())
+        self.update_user(
+            f"Completed percolation for {len(results_df) - n_errors}/{len(results_df)} sections. "
+            f"Results were written under {output_pth}"
+        )
+        if n_errors > 0:
+            failed_sections = results_df.loc[results_df["status"] == "error", "section"].tolist()
+            self.update_user(
+                f"Percolation failed for {n_errors} section(s): {failed_sections}",
+                level=30,
+            )
+        return results_df
 
     @XY.setter
     def XY(self,XY): 
