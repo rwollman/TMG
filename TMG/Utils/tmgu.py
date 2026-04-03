@@ -3,6 +3,8 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.gridspec import GridSpec
 
+import pandas as pd
+
 from scipy.sparse import csr_matrix
 from scipy.spatial import cKDTree
 
@@ -28,6 +30,221 @@ from IPython.display import HTML
 
 import sys
 import time
+
+
+from scipy.stats import entropy
+
+def calculate_mi_from_indices(indices, Type, k=15):
+    """
+    Calculates the discrete-continuous Mutual Information using a kNN indices matrix.
+    
+    Parameters:
+    -----------
+    indices : np.ndarray
+        Shape (N, k). The row indices of the k-nearest neighbors for each cell.
+        Ensure the cell itself is NOT included in this matrix.
+    Type : np.ndarray or pd.Series
+        Shape (N,). The discrete cell type labels.
+    k : int
+        The number of neighbors (should match indices.shape[1]).
+    """
+    start_time = time.time()
+    
+    # Force Type to be a raw numpy array to avoid Pandas index alignment errors
+    Type = np.asarray(Type)
+    N = len(Type)
+    
+    # 1. Calculate N_{s_i}: The total population count for each cell's type
+    unique_types, type_counts = np.unique(Type, return_counts=True)
+    type_to_count = dict(zip(unique_types, type_counts))
+    Ns_array = np.array([type_to_count[t] for t in Type])
+    
+    # 2. Calculate m_i: The number of neighbors of the SAME type
+    # Reshape Type to (N, 1) to broadcast against the (N, k) neighbor types
+    query_types = Type[:, None] 
+    neighbor_types = Type[indices]
+    
+    # Creates a boolean matrix of shape (N, k)
+    is_same_type = (query_types == neighbor_types)
+    
+    # Sum across the rows to get the m count for each cell
+    m = is_same_type.sum(axis=1)
+    
+    # Prevent -inf from log(0) in case a cell is completely isolated from its type
+    m = np.maximum(m, 1) 
+    
+    # 3. Compute the Digamma terms
+    term_N = digamma(N)
+    term_Ns = np.mean(digamma(Ns_array)) 
+    term_m = np.mean(digamma(m))         
+    term_k = digamma(k)
+    
+    # 4. Final Equation (Calculated in nats, converted to bits)
+    MI_nats = term_N - term_Ns + term_m - term_k
+    MI_bits = MI_nats / np.log(2)
+    
+    return MI_bits
+
+def calc_knn_and_mi(X, Type, K=25, metric='correlation', n_jobs=1):
+    """
+    Calculates the k-nearest neighbors (KNN) using pynndescent and computes the MI.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Shape (N, F). Data matrix where each row is a cell.
+    Type : np.ndarray or pd.Series
+        The cell type labels (length N).
+    K : int or array-like of int
+        Number of neighbors. If scalar, returns a single MI value.
+        If array, builds the KNN graph once with max(K) neighbors and returns
+        an MI value for each k — useful for estimating K-dependent bias.
+    metric : str, optional
+        Distance metric for pynndescent (default 'correlation').
+    n_jobs : int, optional
+        Cores for pynndescent (default 1; use -1 for all when calling outside a parallel context).
+
+    Returns
+    -------
+    mi_bits : float or np.ndarray
+        Single MI value if K is scalar; array of shape (len(K),) if K is array-like.
+    """
+    import pynndescent
+
+    scalar_K = np.isscalar(K)
+    K_arr    = np.atleast_1d(np.asarray(K))
+    K_max    = int(K_arr.max())
+
+    index = pynndescent.NNDescent(X, n_neighbors=K_max + 1, metric=metric,
+                                  random_state=42, n_jobs=n_jobs)
+    all_indices, _ = index.neighbor_graph
+    neighbor_indices = all_indices[:, 1:]   # strip self; shape (N, K_max)
+
+    mi_values = np.array([
+        calculate_mi_from_indices(neighbor_indices[:, :k], Type, k)
+        for k in K_arr
+    ])
+
+    return float(mi_values[0]) if scalar_K else mi_values
+
+from scipy.optimize import curve_fit
+
+def _bias_model(N, A, B, C):
+    return A - B * (N ** -C)
+
+def correct_mi_bias(mi, Nvec, bounds=None):
+    """
+    Fit MI(N) = A - B*N^(-C) independently for each (Ncols, iter) pair and
+    return A, the bias-corrected asymptotic MI estimate.
+
+    Parameters
+    ----------
+    mi : np.ndarray, shape (n_nrows, n_ncols, n_iter)
+        Output of run_mi_subsampling.
+    Nvec : array-like, length n_nrows
+        The Nrows values used (must match mi's first axis order).
+    bounds : tuple or None
+        (lower, upper) bounds for (A, B, C).
+        Default: ([0, 0, 0], [inf, inf, 2]).
+
+    Returns
+    -------
+    np.ndarray, shape (n_ncols, n_iter)
+        Bias-corrected MI. NaN where the fit did not converge.
+    """
+    if bounds is None:
+        bounds = ([0.0, 0.0, 0.0], [np.inf, np.inf, 2.0])
+
+    N = np.asarray(Nvec, dtype=float)
+    n_nrows, n_ncols, n_iter = mi.shape
+    result = np.full((n_ncols, n_iter), np.nan)
+
+    for j in range(n_ncols):
+        for t in range(n_iter):
+            try:
+                popt, _ = curve_fit(_bias_model, N, mi[:, j, t],
+                                    bounds=bounds, maxfev=10000)
+                result[j, t] = popt[0]   # A = asymptotic MI
+            except RuntimeError:
+                pass   # leave as NaN if fit fails
+
+    return result
+
+
+def entropy_and_mi(type_mat, label1='0', label2='1'):
+    """
+    Calculate entropy, conditional entropy, and mutual information between columns 0 and 1 of type_mat.
+    Returns a dict:
+    {
+        f'H_{label1}': ...,
+        f'H_{label2}': ...,
+        f'H_{label2}_given_{label1}': ...,
+        f'H_{label1}_given_{label2}': ...,
+        'MI': ...,
+    }
+    Numbers are rounded to two significant digits.
+    """
+
+    # Compute joint table
+    counts = pd.crosstab(type_mat[:,0], type_mat[:,1])
+
+    # Normalize to get joint and marginal probabilities
+    p_xy = counts / counts.values.sum()
+    p_x = p_xy.sum(axis=1)
+    p_y = p_xy.sum(axis=0)
+
+    # Compute mutual information
+    mi = 0.0
+    for i in p_x.index:
+        for j in p_y.index:
+            p_ij = p_xy.loc[i, j]
+            if p_ij > 0:
+                mi += p_ij * np.log2(p_ij / (p_x[i] * p_y[j]))
+
+    # Entropy of type_mat[:,0]
+    values_0, counts_0 = np.unique(type_mat[:,0], return_counts=True)
+    p0 = counts_0 / counts_0.sum()
+    H_0 = entropy(p0, base=2)
+
+    # Entropy of type_mat[:,1]
+    values_1, counts_1 = np.unique(type_mat[:,1], return_counts=True)
+    p1 = counts_1 / counts_1.sum()
+    H_1 = entropy(p1, base=2)
+
+    # Conditional entropy H(type_mat[:,1] | type_mat[:,0])
+    H_1_given_0 = 0.0
+    for val0, count0 in zip(values_0, counts_0):
+        mask = type_mat[:,0] == val0
+        sub_1 = type_mat[mask,1]
+        values_1_sub, counts_1_sub = np.unique(sub_1, return_counts=True)
+        p1_sub = counts_1_sub / counts_1_sub.sum()
+        H_1_given_val0 = entropy(p1_sub, base=2)
+        H_1_given_0 += (count0 / len(type_mat)) * H_1_given_val0
+
+    # Conditional entropy H(type_mat[:,0] | type_mat[:,1])
+    H_0_given_1 = 0.0
+    for val1, count1 in zip(values_1, counts_1):
+        mask = type_mat[:,1] == val1
+        sub_0 = type_mat[mask,0]
+        values_0_sub, counts_0_sub = np.unique(sub_0, return_counts=True)
+        p0_sub = counts_0_sub / counts_0_sub.sum()
+        H_0_given_val1 = entropy(p0_sub, base=2)
+        H_0_given_1 += (count1 / len(type_mat)) * H_0_given_val1
+
+    # Round to two significant digits
+    def sig2(x):
+        if x == 0:
+            return 0.0
+        else:
+            return float(f"{x:.2f}")
+
+    return {
+        f'H_{label1}': sig2(H_0),
+        f'H_{label2}': sig2(H_1),
+        'MI': sig2(mi),
+        f'H_{label2}_given_{label1}': sig2(H_1_given_0),
+        f'H_{label1}_given_{label2}': sig2(H_0_given_1)
+    }
 
 
 def list_entropy(X):
