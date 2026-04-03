@@ -51,6 +51,85 @@ from matplotlib.path import Path
 
 import pdb
 
+def iter_polygon_parts(geom):
+    """
+    Yield polygonal parts from a shapely geometry.
+
+    This keeps Polygon and MultiPolygon handling in one place and filters
+    GeometryCollections down to polygonal content only.
+    """
+    if geom is None or geom.is_empty:
+        return []
+    if isinstance(geom, Polygon):
+        return [geom]
+    if isinstance(geom, MultiPolygon):
+        return [part for part in geom.geoms if not part.is_empty]
+    if isinstance(geom, shapely.geometry.collection.GeometryCollection):
+        parts = []
+        for subgeom in geom.geoms:
+            parts.extend(iter_polygon_parts(subgeom))
+        return parts
+    return []
+
+
+def largest_polygon_part(geom):
+    """
+    Return the largest polygonal part of a geometry.
+    """
+    parts = iter_polygon_parts(geom)
+    if not parts:
+        return MultiPolygon()
+    return max(parts, key=lambda p: p.area)
+
+
+def normalize_polygonal_geometry(geom, keep_multi=True, min_area=None, close_gaps_eps=None):
+    """
+    Normalize a shapely geometry so downstream code only sees Polygon or
+    MultiPolygon outputs.
+    """
+    if geom is None:
+        return MultiPolygon()
+
+    if not geom.is_valid:
+        geom = shapely.validation.make_valid(geom)
+
+    if close_gaps_eps is not None and close_gaps_eps > 0 and not geom.is_empty:
+        geom = geom.buffer(close_gaps_eps).buffer(-close_gaps_eps)
+        if not geom.is_valid:
+            geom = shapely.validation.make_valid(geom)
+
+    parts = []
+    for part in iter_polygon_parts(geom):
+        if part.is_empty:
+            continue
+        if not part.is_valid:
+            fixed = shapely.validation.make_valid(part)
+            parts.extend(iter_polygon_parts(fixed))
+        else:
+            parts.append(part)
+
+    if min_area is not None:
+        parts = [part for part in parts if part.area >= min_area]
+
+    if not parts:
+        return MultiPolygon()
+
+    merged = unary_union(parts)
+    if not merged.is_valid:
+        merged = shapely.validation.make_valid(merged)
+
+    merged_parts = [part for part in iter_polygon_parts(merged) if not part.is_empty]
+    if min_area is not None:
+        merged_parts = [part for part in merged_parts if part.area >= min_area]
+
+    if not merged_parts:
+        return MultiPolygon()
+    if len(merged_parts) == 1:
+        return merged_parts[0]
+    if keep_multi:
+        return MultiPolygon(merged_parts)
+    return largest_polygon_part(MultiPolygon(merged_parts))
+
 def voronoi_polygons(XY):
     """
     Creates voronoi as list of Shapely polygons
@@ -161,23 +240,13 @@ def mask_voronoi(vor_polys,mask_polys,area_thresh_percentile = 95):
     vor_poly_area = np.array([p.area for p in vor_polys])
     vor_ids = np.flatnonzero(vor_poly_area > np.percentile(vor_poly_area,area_thresh_percentile))
     mask_polys = shapely.geometry.MultiPolygon(mask_polys)
-    # after intersections, there are cases where shapely doesn't return a single polygons
-    # the code below deals with it by checking for edge cases: MultiPolygon, GeometryCollection    
     for pix in vor_ids:
         v = vor_polys[pix]
-        vp = v.intersection(mask_polys)
-        if isinstance(vp,shapely.geometry.MultiPolygon):
-            allparts = list(vp.geoms)
-            areas = np.array([p.area for p in allparts])
-            vor_polys[pix] = allparts[np.argmax(areas)]
-        elif isinstance(vp,shapely.geometry.collection.GeometryCollection):
-            # first get only the polygons from this geometry collection
-            g_ispolygon = np.array([isinstance(g,shapely.geometry.polygon.Polygon) for g in list(vp.geoms)])
-            allparts = np.array(list(vp.geoms))
-            allparts = allparts[g_ispolygon]
-            # then chose the largest one
-            areas = np.array([p.area for p in list(allparts)])
-            vor_polys[pix] = allparts[np.argmax(areas)]
+        vp = normalize_polygonal_geometry(v.intersection(mask_polys), keep_multi=True)
+        # A masked Voronoi cell should remain a single polygonal object, so if
+        # the tissue edge fragments it keep the largest polygonal piece.
+        if isinstance(vp, MultiPolygon):
+            vor_polys[pix] = largest_polygon_part(vp)
         else:
             vor_polys[pix] = vp
 
@@ -271,30 +340,29 @@ def vectorize_labeled_matrix_to_polygons(imgmat,tolerance = 2):
     # the list of polygons according to ids (unique sorted) order. 
     unq = np.unique(ids) 
     unq_poly = []
-    verts = []
     max_iter = 5
     for i in range(len(unq)):
         ix = np.flatnonzero(ids==unq[i])
         multipoly=shapely.geometry.MultiPolygon(list(polygons[ix]))
         if not multipoly.is_valid:
             multipoly = shapely.validation.make_valid(multipoly)
-        poly = shapely.ops.unary_union(multipoly)
+        poly = normalize_polygonal_geometry(shapely.ops.unary_union(multipoly), keep_multi=True)
         # it is possible that poly is not really a polygon as union can't work if polygons are seperated. 
         # to deal with this the code does 2 things:  
         # 1. try to buffer(1) up to max_iter times and see if the union becomes a single polygon 
         # 2. choose the largest of the polygons in the multipolygon. 
         cnt=0
-        while cnt<max_iter and isinstance(poly,shapely.geometry.multipolygon.MultiPolygon):
-            poly.buffer(1)
-            poly = shapely.ops.unary_union(poly)
+        while cnt<max_iter and isinstance(poly, MultiPolygon):
+            poly = normalize_polygonal_geometry(poly.buffer(1), keep_multi=True)
             cnt=cnt+1
         # if the first solutions doesn't work, just get the largest polygon by area
-        if isinstance(poly,shapely.geometry.multipolygon.MultiPolygon):
-            allparts = [p.buffer(0) for p in poly.geoms]
-            areas = np.array([p.area for p in poly.geoms])
-            poly = allparts[np.argmax(areas)]
+        if isinstance(poly, MultiPolygon):
+            poly = largest_polygon_part(poly)
 
-        poly.simplify(tolerance)
+        simplified = poly.simplify(tolerance, preserve_topology=True)
+        simplified = normalize_polygonal_geometry(simplified, keep_multi=False)
+        if not simplified.is_empty:
+            poly = simplified
         unq_poly.append(poly)
 
     return unq_poly
@@ -311,11 +379,15 @@ def get_polygons_vertices(polygons,return_inner_verts = True):
     verts=[];
     inner_verts = []; 
     for i,poly in enumerate(polygons):
-        if isinstance(poly, shapely.geometry.MultiPolygon):
+        poly_parts = iter_polygon_parts(poly)
+        if return_inner_verts:
+            inner_verts.append(list())
+        if not poly_parts:
+            verts.append(list())
+            continue
+        if len(poly_parts) > 1:
             multi_verts = list()
-            if return_inner_verts:
-                inner_verts.append(list())
-            for poly2 in poly.geoms:
+            for poly2 in poly_parts:
                 xy = poly2.exterior.xy
                 multi_verts.append(np.array(xy).T)
                 if return_inner_verts:
@@ -325,11 +397,11 @@ def get_polygons_vertices(polygons,return_inner_verts = True):
                         inner_verts[i].append(xy)
             verts.append(multi_verts)
         else:
-            xy = poly.exterior.xy
+            poly2 = poly_parts[0]
+            xy = poly2.exterior.xy
             verts.append(np.array(xy).T)
             if return_inner_verts:
-                inner_verts.append(list())
-                for LinearRing in poly.interiors:
+                for LinearRing in poly2.interiors:
                     xi,yi = LinearRing.xy
                     xy = np.transpose(np.vstack((xi,yi)))
                     inner_verts[i].append(xy)
@@ -597,7 +669,14 @@ def plot_polygon_boundaries(verts_or_polys, rgb_edges=None, ax=None, xlm=None, y
 
     # Convert verts_or_polys to just be verts, applying inward offset if specified
     if isinstance(verts_or_polys[0], (shapely.geometry.Polygon, shapely.geometry.MultiPolygon)):
-        buffered_polys = [poly.buffer(-inward_offset) for poly in verts_or_polys if poly.area > 0]
+        buffered_polys = []
+        for poly in verts_or_polys:
+            if poly.area <= 0:
+                continue
+            buffered = poly if inward_offset == 0 else poly.buffer(-inward_offset)
+            buffered = normalize_polygonal_geometry(buffered, keep_multi=True)
+            if not buffered.is_empty:
+                buffered_polys.append(buffered)
         verts = get_polygons_vertices(buffered_polys,return_inner_verts=False)
     else:
         verts = verts_or_polys
@@ -864,7 +943,8 @@ def in_graph_large_connected_components(XY,Section = None,max_dist = 300,large_c
 
     return(in_large_comp)
 
-def merge_polygons_by_ids(polys,ids,max_buff = 0.01,dbuffer=0.001, smooth_telerance = None):
+def merge_polygons_by_ids(polys,ids,max_buff = 0.01,dbuffer=0.001, smooth_telerance = None,
+                          repair=True, min_part_area=None, close_gaps_eps=None, keep_multi=True):
     """
     merges nearby poygons based on id vectors. 
     if polygons are not really touching, it will expand them slightsly until they do. 
@@ -878,21 +958,49 @@ def merge_polygons_by_ids(polys,ids,max_buff = 0.01,dbuffer=0.001, smooth_telera
         # Flatten any MultiPolygons from the base layer into individual Polygons
         poly_list = []
         for i in ix:
-            p = polys[i]
-            if isinstance(p, MultiPolygon):
-                poly_list.extend(p.geoms)
-            else:
-                poly_list.append(p)
-        for i, poly in enumerate(poly_list):
-            if not poly.is_valid:
-                new_exterior = poly.exterior
-                new_holes = [hole for hole in poly.interiors if Polygon(new_exterior).contains(Polygon(hole))]
-                poly_list[i] = Polygon(new_exterior, new_holes)
+            p = normalize_polygonal_geometry(polys[i], keep_multi=True)
+            poly_list.extend(iter_polygon_parts(p))
+        if not poly_list:
+            all_merged_polys.append(MultiPolygon())
+            continue
         merged_poly = unary_union(poly_list)
-        all_merged_polys.append(merged_poly)
+        if repair:
+            merged_poly = normalize_polygonal_geometry(
+                merged_poly,
+                keep_multi=keep_multi,
+                min_area=min_part_area,
+            )
 
-    if smooth_telerance is not None: 
-        all_merged_polys=[p.simplify(smooth_telerance) for p in all_merged_polys]
+            # Restore the original "expand slightly until they touch" intent,
+            # but stop as soon as the merged object is no longer fragmented.
+            gap_step = dbuffer if close_gaps_eps is None else close_gaps_eps
+            if gap_step is not None and gap_step > 0 and max_buff is not None and max_buff > 0:
+                n_steps = max(1, int(np.ceil(max_buff / gap_step)))
+                current_eps = gap_step
+                step = 0
+                while step < n_steps and isinstance(merged_poly, MultiPolygon):
+                    closed = merged_poly.buffer(current_eps).buffer(-current_eps)
+                    closed = normalize_polygonal_geometry(
+                        closed,
+                        keep_multi=keep_multi,
+                        min_area=min_part_area,
+                    )
+                    if not closed.is_empty:
+                        merged_poly = closed
+                    if not isinstance(merged_poly, MultiPolygon):
+                        break
+                    current_eps += gap_step
+                    step += 1
+
+        if smooth_telerance is not None:
+            merged_poly = merged_poly.simplify(smooth_telerance, preserve_topology=True)
+            merged_poly = normalize_polygonal_geometry(
+                merged_poly,
+                keep_multi=keep_multi,
+                min_area=min_part_area,
+            )
+
+        all_merged_polys.append(merged_poly)
     
     return all_merged_polys
 
