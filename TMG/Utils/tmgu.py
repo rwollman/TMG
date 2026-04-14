@@ -1,3 +1,8 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Iterable, Sequence
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
@@ -31,59 +36,98 @@ from IPython.display import HTML
 import sys
 import time
 
-
+from scipy.special import digamma
 from scipy.stats import entropy
 
-def calculate_mi_from_indices(indices, Type, k=15):
+import multiprocessing as mp
+import contextlib, io, os
+
+_shared_X    = None
+_shared_Type = None
+
+def _mi_worker(args):
+    nrows, ncols, K, metric, seed = args
+    rng = np.random.default_rng(seed)
+    row_idx = rng.choice(_shared_X.shape[0], size=nrows, replace=False)
+    col_idx = rng.choice(_shared_X.shape[1], size=ncols, replace=False)
+    X_sub    = _shared_X[np.ix_(row_idx, col_idx)]
+    Type_sub = _shared_Type[row_idx]
+    with contextlib.redirect_stdout(io.StringIO()):
+        return calc_knn_and_mi(X_sub, Type_sub, K=K, metric=metric)
+
+
+def run_mi_subsampling(X, Type, Nrows, Ncols, n_iter, K=25, metric='correlation', n_jobs=None):
     """
-    Calculates the discrete-continuous Mutual Information using a kNN indices matrix.
-    
-    Parameters:
-    -----------
-    indices : np.ndarray
-        Shape (N, k). The row indices of the k-nearest neighbors for each cell.
-        Ensure the cell itself is NOT included in this matrix.
-    Type : np.ndarray or pd.Series
-        Shape (N,). The discrete cell type labels.
-    k : int
-        The number of neighbors (should match indices.shape[1]).
+    Run MI estimation over a grid of subsampling conditions, in parallel.
+
+    Runs every combination of Nrows × Ncols (Cartesian product), each repeated
+    n_iter times. X is shared with workers via fork copy-on-write — no copying.
+
+    Parameters
+    ----------
+    X : np.ndarray, shape (N, F)
+    Type : array-like, length N
+    Nrows : int or array-like of int
+        Row subsample size(s).
+    Ncols : int or array-like of int
+        Column subsample size(s).
+    n_iter : int
+        Number of MI estimates per (Nrows, Ncols) condition.
+    K : int
+        kNN neighbours (default 25).
+    metric : str
+        pynndescent distance metric (default 'correlation').
+    n_jobs : int or None
+        Worker processes. None → all available CPUs.
+
+    Returns
+    -------
+    np.ndarray, shape (n_nrows, n_ncols, n_iter)
     """
-    start_time = time.time()
-    
-    # Force Type to be a raw numpy array to avoid Pandas index alignment errors
-    Type = np.asarray(Type)
-    N = len(Type)
-    
-    # 1. Calculate N_{s_i}: The total population count for each cell's type
-    unique_types, type_counts = np.unique(Type, return_counts=True)
-    type_to_count = dict(zip(unique_types, type_counts))
-    Ns_array = np.array([type_to_count[t] for t in Type])
-    
-    # 2. Calculate m_i: The number of neighbors of the SAME type
-    # Reshape Type to (N, 1) to broadcast against the (N, k) neighbor types
-    query_types = Type[:, None] 
-    neighbor_types = Type[indices]
-    
-    # Creates a boolean matrix of shape (N, k)
-    is_same_type = (query_types == neighbor_types)
-    
-    # Sum across the rows to get the m count for each cell
-    m = is_same_type.sum(axis=1)
-    
-    # Prevent -inf from log(0) in case a cell is completely isolated from its type
-    m = np.maximum(m, 1) 
-    
-    # 3. Compute the Digamma terms
-    term_N = digamma(N)
-    term_Ns = np.mean(digamma(Ns_array)) 
-    term_m = np.mean(digamma(m))         
-    term_k = digamma(k)
-    
-    # 4. Final Equation (Calculated in nats, converted to bits)
-    MI_nats = term_N - term_Ns + term_m - term_k
-    MI_bits = MI_nats / np.log(2)
-    
-    return MI_bits
+    global _shared_X, _shared_Type
+
+    if n_jobs is None:
+        n_jobs = os.cpu_count()
+
+    Nrows_arr = np.atleast_1d(np.asarray(Nrows))
+    Ncols_arr = np.atleast_1d(np.asarray(Ncols))
+    n_r, n_c  = len(Nrows_arr), len(Ncols_arr)
+
+    _shared_X    = X
+    _shared_Type = np.asarray(Type)
+
+    rng   = np.random.default_rng(42)
+    seeds = rng.integers(0, 2**31, size=n_r * n_c * n_iter)
+
+    tasks = [
+        (int(nr), int(nc), K, metric, int(seeds[(i * n_c + j) * n_iter + t]))
+        for i, nr in enumerate(Nrows_arr)
+        for j, nc in enumerate(Ncols_arr)
+        for t in range(n_iter)
+    ]
+
+    ctx = mp.get_context('fork')
+    with ctx.Pool(processes=n_jobs) as pool:
+        flat = pool.map(_mi_worker, tasks)
+
+    return np.array(flat).reshape(n_r, n_c, n_iter)
+
+def calculate_mi_from_indices(indices: np.ndarray, labels, k: int) -> float:
+    """Ross/KSG-style discrete-continuous MI estimate from a kNN index matrix."""
+    labels = np.asarray(labels)
+    n = len(labels)
+
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    label_counts = dict(zip(unique_labels, counts))
+    n_s = np.array([label_counts[label] for label in labels])
+
+    query_labels = labels[:, None]
+    neighbor_labels = labels[indices]
+    m = (query_labels == neighbor_labels).sum(axis=1)
+    m = np.maximum(m, 1)
+
+    mi_nats = digamma(n) - np.mean(digamma(n_s)) + np.mean(digamma(m)) - digamma(k)
+    return float(mi_nats / np.log(2.0))
 
 def calc_knn_and_mi(X, Type, K=25, metric='correlation', n_jobs=1):
     """
@@ -841,3 +885,559 @@ class ToyGraph:
                 f.write("</html>")
                 
         return html
+
+
+# ---------------------------------------------------------------------------
+# Cell-type alphabet discovery (MI-based gene selection)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class BalancedBinarySample:
+    target_type: object
+    row_indices: np.ndarray
+    labels: np.ndarray
+    X: np.ndarray
+
+
+_shared_discovery_X = None
+_shared_discovery_types = None
+_shared_discovery_gene_names = None
+
+
+def _as_numpy(values) -> np.ndarray:
+    if hasattr(values, "to_numpy"):
+        return values.to_numpy()
+    return np.asarray(values)
+
+
+def get_gene_names(adata, n_features: int | None = None) -> np.ndarray:
+    """Best-effort gene-name extraction for the first n_features columns."""
+    candidates = ("gene_symbol", "gene", "symbol", "feature_name")
+    names = None
+
+    if hasattr(adata, "var"):
+        for column in candidates:
+            if column in adata.var.columns:
+                names = adata.var[column].astype(str).to_numpy()
+                break
+        if names is None:
+            names = adata.var.index.astype(str).to_numpy()
+    else:
+        raise ValueError("adata must expose a .var table or index")
+
+    if n_features is None:
+        return names
+    return names[:n_features]
+
+
+def get_eligible_types(types, min_cells: int = 1000) -> pd.DataFrame:
+    values = _as_numpy(types)
+    unique_types, counts = np.unique(values, return_counts=True)
+    order = np.argsort(counts)[::-1]
+    table = pd.DataFrame(
+        {
+            "target_type": unique_types[order],
+            "n_cells": counts[order],
+        }
+    )
+    return table.loc[table["n_cells"] >= min_cells].reset_index(drop=True)
+
+
+def draw_balanced_binary_sample(
+    X: np.ndarray,
+    types,
+    target_type,
+    n_per_class: int = 1000,
+    rng=None,
+) -> BalancedBinarySample:
+    """Create a balanced target-vs-background problem for one cell type."""
+    rng = np.random.default_rng(rng)
+    types = _as_numpy(types)
+    target_mask = types == target_type
+    target_idx = np.flatnonzero(target_mask)
+    background_idx = np.flatnonzero(~target_mask)
+
+    if len(target_idx) < n_per_class:
+        raise ValueError(
+            f"Target '{target_type}' has only {len(target_idx)} cells, "
+            f"but n_per_class={n_per_class}."
+        )
+    if len(background_idx) < n_per_class:
+        raise ValueError(
+            f"Background for '{target_type}' has only {len(background_idx)} cells, "
+            f"but n_per_class={n_per_class}."
+        )
+
+    pos_idx = rng.choice(target_idx, size=n_per_class, replace=False)
+    neg_idx = rng.choice(background_idx, size=n_per_class, replace=False)
+    row_indices = np.concatenate([pos_idx, neg_idx])
+    labels = np.concatenate(
+        [
+            np.ones(n_per_class, dtype=np.int8),
+            np.zeros(n_per_class, dtype=np.int8),
+        ]
+    )
+
+    shuffle = rng.permutation(len(row_indices))
+    row_indices = row_indices[shuffle]
+    labels = labels[shuffle]
+
+    return BalancedBinarySample(
+        target_type=target_type,
+        row_indices=row_indices,
+        labels=labels,
+        X=np.asarray(X)[row_indices],
+    )
+
+
+def add_micro_jitter(X: np.ndarray, jitter_scale: float = 1e-6, rng=None) -> np.ndarray:
+    """Break ties without changing the large-scale geometry of expression space."""
+    rng = np.random.default_rng(rng)
+    X = np.asarray(X, dtype=np.float64)
+    scale = np.nanstd(X, axis=0, ddof=0)
+    if X.ndim == 1:
+        scale = np.asarray([float(scale)])
+    scale = np.where(scale > 0, scale, 1.0)
+    noise = rng.normal(scale=jitter_scale * scale, size=X.shape)
+    return X + noise
+
+
+def zscore_columns(X: np.ndarray) -> np.ndarray:
+    X = np.asarray(X, dtype=np.float64)
+    mean = X.mean(axis=0, keepdims=True)
+    std = X.std(axis=0, keepdims=True)
+    std = np.where(std > 0, std, 1.0)
+    return (X - mean) / std
+
+
+def sorted_1d_knn_indices(values: np.ndarray, k: int) -> np.ndarray:
+    """Exact 1D kNN via sorting rather than repeated tree construction."""
+    x = np.asarray(values, dtype=np.float64).reshape(-1)
+    n = len(x)
+    if not 0 < k < n:
+        raise ValueError(f"k must satisfy 0 < k < n, got k={k}, n={n}")
+
+    order = np.argsort(x, kind="mergesort")
+    sorted_x = x[order]
+    result = np.empty((n, k), dtype=np.int32)
+
+    for rank, row_idx in enumerate(order):
+        left = rank - 1
+        right = rank + 1
+        chosen = []
+        while len(chosen) < k:
+            if left < 0:
+                chosen.append(order[right])
+                right += 1
+            elif right >= n:
+                chosen.append(order[left])
+                left -= 1
+            else:
+                left_dist = abs(sorted_x[rank] - sorted_x[left])
+                right_dist = abs(sorted_x[right] - sorted_x[rank])
+                if left_dist <= right_dist:
+                    chosen.append(order[left])
+                    left -= 1
+                else:
+                    chosen.append(order[right])
+                    right += 1
+        result[row_idx] = chosen
+
+    return result
+
+
+def exact_knn_indices(X: np.ndarray, k: int, workers: int = 1) -> np.ndarray:
+    X = np.asarray(X, dtype=np.float64)
+    if X.ndim == 1:
+        return sorted_1d_knn_indices(X, k=k)
+
+    n = X.shape[0]
+    if not 0 < k < n:
+        raise ValueError(f"k must satisfy 0 < k < n, got k={k}, n={n}")
+
+    tree = cKDTree(X)
+    _, indices = tree.query(X, k=k + 1, workers=workers)
+    return np.asarray(indices[:, 1:], dtype=np.int32)
+
+
+def mi_from_expression(
+    X: np.ndarray,
+    labels,
+    k: int = 25,
+    standardize: bool = True,
+    knn_workers: int = 1,
+) -> float:
+    X = np.asarray(X, dtype=np.float64)
+    if X.ndim == 1:
+        indices = sorted_1d_knn_indices(X, k=k)
+    else:
+        X_eval = zscore_columns(X) if standardize else X
+        indices = exact_knn_indices(X_eval, k=k, workers=knn_workers)
+    return calculate_mi_from_indices(indices, labels, k=k)
+
+
+def screen_primary_markers(
+    X: np.ndarray,
+    labels,
+    gene_names: Sequence[str],
+    k: int = 25,
+    jitter_scale: float = 1e-6,
+    rng=None,
+    knn_workers: int = 1,
+) -> pd.DataFrame:
+    rng = np.random.default_rng(rng)
+    X_jittered = add_micro_jitter(X, jitter_scale=jitter_scale, rng=rng)
+    rows = []
+    for gene_idx in range(X_jittered.shape[1]):
+        mi_bits = mi_from_expression(
+            X_jittered[:, gene_idx],
+            labels,
+            k=k,
+            standardize=False,
+            knn_workers=knn_workers,
+        )
+        rows.append(
+            {
+                "gene_index": gene_idx,
+                "gene_name": str(gene_names[gene_idx]),
+                "mi_bits": mi_bits,
+            }
+        )
+
+    screen = pd.DataFrame(rows).sort_values("mi_bits", ascending=False).reset_index(drop=True)
+    screen["rank"] = np.arange(1, len(screen) + 1)
+    return screen
+
+
+def greedy_forward_selection(
+    X: np.ndarray,
+    labels,
+    gene_names: Sequence[str],
+    max_genes: int = 10,
+    k: int = 25,
+    jitter_scale: float = 1e-6,
+    rng=None,
+    standardize: bool = True,
+    knn_workers: int = 1,
+) -> dict[str, object]:
+    """Greedily build an information-maximizing gene alphabet for one binary task."""
+    if max_genes < 1:
+        raise ValueError("max_genes must be at least 1")
+
+    rng = np.random.default_rng(rng)
+    X_jittered = add_micro_jitter(X, jitter_scale=jitter_scale, rng=rng)
+    screen = screen_primary_markers(
+        X_jittered,
+        labels,
+        gene_names=gene_names,
+        k=k,
+        jitter_scale=0.0,
+        knn_workers=knn_workers,
+    )
+
+    selected = [int(screen.iloc[0]["gene_index"])]
+    curve_rows = [
+        {
+            "step": 1,
+            "selected_gene_index": selected[0],
+            "selected_gene": str(gene_names[selected[0]]),
+            "mi_bits": float(screen.iloc[0]["mi_bits"]),
+            "delta_bits": float(screen.iloc[0]["mi_bits"]),
+        }
+    ]
+
+    remaining = set(range(X_jittered.shape[1])) - set(selected)
+
+    while len(selected) < min(max_genes, X_jittered.shape[1]):
+        best_gene = None
+        best_mi = -np.inf
+
+        for gene_idx in remaining:
+            cols = selected + [gene_idx]
+            candidate_mi = mi_from_expression(
+                X_jittered[:, cols],
+                labels,
+                k=k,
+                standardize=standardize,
+                knn_workers=knn_workers,
+            )
+            if candidate_mi > best_mi:
+                best_mi = candidate_mi
+                best_gene = gene_idx
+
+        previous_mi = float(curve_rows[-1]["mi_bits"])
+        recorded_mi = max(float(best_mi), previous_mi)
+        selected.append(int(best_gene))
+        remaining.remove(best_gene)
+        curve_rows.append(
+            {
+                "step": len(selected),
+                "selected_gene_index": int(best_gene),
+                "selected_gene": str(gene_names[best_gene]),
+                "mi_bits": recorded_mi,
+                "delta_bits": float(recorded_mi - previous_mi),
+            }
+        )
+
+    return {
+        "curve": pd.DataFrame(curve_rows),
+        "screen": screen,
+        "selected_gene_indices": selected,
+        "selected_gene_names": [str(gene_names[idx]) for idx in selected],
+    }
+
+
+def _set_discovery_globals(X, types, gene_names) -> None:
+    global _shared_discovery_X, _shared_discovery_types, _shared_discovery_gene_names
+    _shared_discovery_X = np.asarray(X)
+    _shared_discovery_types = _as_numpy(types)
+    _shared_discovery_gene_names = np.asarray(gene_names, dtype=object)
+
+
+def _run_single_discovery_task(
+    X: np.ndarray,
+    types: np.ndarray,
+    gene_names: Sequence[str],
+    task,
+) -> dict[str, object]:
+    (
+        target_type,
+        repeat,
+        n_per_class,
+        max_genes,
+        k,
+        jitter_scale,
+        seed,
+        standardize,
+        knn_workers,
+    ) = task
+
+    sample = draw_balanced_binary_sample(
+        X,
+        types,
+        target_type=target_type,
+        n_per_class=n_per_class,
+        rng=seed,
+    )
+    run = greedy_forward_selection(
+        sample.X,
+        sample.labels,
+        gene_names=gene_names,
+        max_genes=max_genes,
+        k=k,
+        jitter_scale=jitter_scale,
+        rng=seed,
+        standardize=standardize,
+        knn_workers=knn_workers,
+    )
+
+    curve = run["curve"].copy()
+    curve["target_type"] = target_type
+    curve["repeat"] = repeat
+
+    screen = run["screen"].copy()
+    screen["target_type"] = target_type
+    screen["repeat"] = repeat
+
+    selected_rows = [
+        {
+            "target_type": target_type,
+            "repeat": repeat,
+            "step": step,
+            "gene_name": gene_name,
+            "gene_index": int(run["selected_gene_indices"][step - 1]),
+        }
+        for step, gene_name in enumerate(run["selected_gene_names"], start=1)
+    ]
+
+    return {
+        "curve": curve,
+        "screen": screen,
+        "selected_genes": pd.DataFrame(selected_rows),
+    }
+
+
+def _discovery_worker(task) -> dict[str, object]:
+    if _shared_discovery_X is None or _shared_discovery_types is None or _shared_discovery_gene_names is None:
+        raise RuntimeError("Shared discovery state is not initialized")
+    return _run_single_discovery_task(
+        _shared_discovery_X,
+        _shared_discovery_types,
+        _shared_discovery_gene_names,
+        task,
+    )
+
+
+def _resolve_mp_context(start_method: str | None):
+    if start_method is None:
+        return mp.get_context()
+    try:
+        return mp.get_context(start_method)
+    except ValueError:
+        return mp.get_context()
+
+
+def run_cell_type_alphabet_discovery(
+    X: np.ndarray,
+    types,
+    gene_names: Sequence[str],
+    target_types: Iterable | None = None,
+    min_cells: int = 1000,
+    n_per_class: int = 1000,
+    max_genes: int = 10,
+    k: int = 25,
+    n_repeats: int = 1,
+    jitter_scale: float = 1e-6,
+    random_state: int = 0,
+    standardize: bool = True,
+    n_jobs: int | None = None,
+    knn_workers: int = 1,
+    mp_start_method: str | None = "fork",
+    chunksize: int = 1,
+) -> dict[str, object]:
+    types = _as_numpy(types)
+    gene_names = np.asarray(gene_names, dtype=object)
+    eligible = get_eligible_types(types, min_cells=min_cells)
+
+    if target_types is None:
+        target_types = eligible["target_type"].tolist()
+    else:
+        target_types = list(target_types)
+
+    rng = np.random.default_rng(random_state)
+    tasks = [
+        (
+            target_type,
+            repeat,
+            n_per_class,
+            max_genes,
+            k,
+            jitter_scale,
+            int(rng.integers(0, 2**31 - 1)),
+            standardize,
+            knn_workers,
+        )
+        for target_type in target_types
+        for repeat in range(n_repeats)
+    ]
+
+    if n_jobs is None:
+        n_jobs = os.cpu_count() or 1
+    n_jobs = max(1, min(int(n_jobs), max(len(tasks), 1)))
+
+    if not tasks:
+        empty_curve = pd.DataFrame(
+            columns=["step", "selected_gene_index", "selected_gene", "mi_bits", "delta_bits", "target_type", "repeat"]
+        )
+        empty_screen = pd.DataFrame(
+            columns=["gene_index", "gene_name", "mi_bits", "rank", "target_type", "repeat"]
+        )
+        empty_selected = pd.DataFrame(columns=["target_type", "repeat", "step", "gene_name", "gene_index"])
+        return {
+            "curves": empty_curve,
+            "screens": empty_screen,
+            "selected_genes": empty_selected,
+            "eligible_types": eligible,
+            "config": {
+                "min_cells": min_cells,
+                "n_per_class": n_per_class,
+                "max_genes": max_genes,
+                "k": k,
+                "n_repeats": n_repeats,
+                "jitter_scale": jitter_scale,
+                "random_state": random_state,
+                "standardize": standardize,
+                "n_jobs": n_jobs,
+                "knn_workers": knn_workers,
+                "mp_start_method": mp_start_method,
+                "chunksize": chunksize,
+            },
+        }
+
+    if n_jobs == 1:
+        task_results = [
+            _run_single_discovery_task(X, types, gene_names, task)
+            for task in tasks
+        ]
+    else:
+        ctx = _resolve_mp_context(mp_start_method)
+        _set_discovery_globals(X, types, gene_names)
+        pool_kwargs = {"processes": n_jobs}
+        if ctx.get_start_method() != "fork":
+            pool_kwargs["initializer"] = _set_discovery_globals
+            pool_kwargs["initargs"] = (X, types, gene_names)
+        with ctx.Pool(**pool_kwargs) as pool:
+            task_results = pool.map(_discovery_worker, tasks, chunksize=chunksize)
+
+    return {
+        "curves": pd.concat([result["curve"] for result in task_results], ignore_index=True),
+        "screens": pd.concat([result["screen"] for result in task_results], ignore_index=True),
+        "selected_genes": pd.concat([result["selected_genes"] for result in task_results], ignore_index=True),
+        "eligible_types": eligible,
+        "config": {
+            "min_cells": min_cells,
+            "n_per_class": n_per_class,
+            "max_genes": max_genes,
+            "k": k,
+            "n_repeats": n_repeats,
+            "jitter_scale": jitter_scale,
+            "random_state": random_state,
+            "standardize": standardize,
+            "n_jobs": n_jobs,
+            "knn_workers": knn_workers,
+            "mp_start_method": mp_start_method,
+            "chunksize": chunksize,
+        },
+    }
+
+
+def summarize_saturation_threshold(results, threshold_bits: float = 0.90) -> pd.DataFrame:
+    curves = results["curves"].copy()
+    final_step = curves.groupby(["target_type", "repeat"])["step"].max().rename("max_step")
+    first_crossing = (
+        curves.loc[curves["mi_bits"] >= threshold_bits]
+        .groupby(["target_type", "repeat"])["step"]
+        .min()
+        .rename("genes_to_threshold")
+    )
+
+    summary = (
+        curves.groupby(["target_type", "repeat"])["mi_bits"]
+        .max()
+        .rename("best_mi_bits")
+        .to_frame()
+        .join(final_step)
+        .join(first_crossing)
+        .reset_index()
+    )
+    summary["genes_to_threshold"] = summary["genes_to_threshold"].fillna(summary["max_step"] + 1)
+
+    grouped = (
+        summary.groupby("target_type")
+        .agg(
+            n_repeats=("repeat", "nunique"),
+            mean_best_mi_bits=("best_mi_bits", "mean"),
+            std_best_mi_bits=("best_mi_bits", "std"),
+            mean_genes_to_threshold=("genes_to_threshold", "mean"),
+            median_genes_to_threshold=("genes_to_threshold", "median"),
+            min_genes_to_threshold=("genes_to_threshold", "min"),
+            max_genes_to_threshold=("genes_to_threshold", "max"),
+        )
+        .reset_index()
+        .sort_values(
+            ["mean_genes_to_threshold", "mean_best_mi_bits", "target_type"],
+            ascending=[True, False, True],
+        )
+        .reset_index(drop=True)
+    )
+    return grouped
+
+
+def average_type_curves(results) -> pd.DataFrame:
+    curves = results["curves"].copy()
+    return (
+        curves.groupby(["target_type", "step"])["mi_bits"]
+        .agg(["mean", "std", "count"])
+        .reset_index()
+        .rename(columns={"mean": "mi_bits_mean", "std": "mi_bits_std"})
+    )
